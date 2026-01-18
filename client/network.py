@@ -23,3 +23,4 @@ class Network:
                     print("Server found:", self.server_ip)
         except socket.timeout:
             print("Server discovery timed out. No server found on network.")
+
