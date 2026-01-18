@@ -4,27 +4,15 @@ DISCOVERY_PORT = 50000
 CONTROL_PORT = 50001
 AUDIO_PORT = 50002
 
-clients = {}      # id -> (ip, audio_port)
-talking = {}      # id -> [target_ids]
-
-def get_broadcast_ip():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect(("8.8.8.8", 80))
-    local_ip = s.getsockname()[0]
-    s.close()
-    ip_parts = local_ip.split('.')
-    ip_parts[3] = '255'
-    return '.'.join(ip_parts)
+clients = {}   # client_id -> (ip, audio_port)
+talking = {}   # client_id -> set(target_ids)
 
 def broadcast_server():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    broadcast_ip = get_broadcast_ip()
-    print(f"Broadcasting to {broadcast_ip}:{DISCOVERY_PORT}")
     while True:
-        s.sendto(b"VOICE_SERVER", (broadcast_ip, DISCOVERY_PORT))
+        s.sendto(b"VOICE_SERVER", ("<broadcast>", DISCOVERY_PORT))
         import time; time.sleep(2)
-
 
 def control_listener():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -35,7 +23,6 @@ def control_listener():
         ip = addr[0]
         text = msg.decode()
 
-        # Client asks to register ID
         if text.startswith("REGISTER:"):
             cid, port = text.split(":")[1:]
             if cid in clients:
@@ -43,18 +30,11 @@ def control_listener():
             else:
                 clients[cid] = (ip, int(port))
                 s.sendto(b"OK", addr)
-                print(f"{cid} joined from {ip}")
+                print(f"{cid} registered from {ip}")
 
-        # Client says who it wants to talk to
-        elif text.startswith("TARGETS:"):
+        elif text.startswith("TALK:"):
             cid, targets = text.split(":")[1:]
-            talking[cid] = targets.split(",")
-
-            # notify receivers
-            for t in talking[cid]:
-                if t in clients:
-                    s.sendto(f"SPEAKING:{cid}".encode(), (clients[t][0], CONTROL_PORT))
-
+            talking[cid] = set(targets.split(",")) if targets else set()
 
 def audio_router():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -62,11 +42,13 @@ def audio_router():
 
     while True:
         data, addr = s.recvfrom(4096)
+        sender_ip = addr[0]
 
         sender = None
         for cid, (ip, _) in clients.items():
-            if ip == addr[0]:
+            if ip == sender_ip:
                 sender = cid
+                break
 
         if not sender or sender not in talking:
             continue
@@ -74,8 +56,7 @@ def audio_router():
         for target in talking[sender]:
             if target in clients:
                 ip, port = clients[target]
-                s.sendto(data, (ip, port))
-
+                s.sendto(sender.encode() + b":" + data, (ip, port))
 
 threading.Thread(target=broadcast_server, daemon=True).start()
 threading.Thread(target=control_listener, daemon=True).start()
