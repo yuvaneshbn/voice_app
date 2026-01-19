@@ -1,4 +1,4 @@
-from PyQt5.QtWidgets import QDialog, QPushButton, QVBoxLayout, QLabel, QMessageBox, QLineEdit, QHBoxLayout
+from PySide6.QtWidgets import QDialog, QPushButton, QVBoxLayout, QLabel, QMessageBox, QLineEdit, QHBoxLayout
 import socket
 import threading
 import time

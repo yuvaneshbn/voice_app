@@ -1,5 +1,5 @@
 import sys, socket
-from PyQt5.QtWidgets import QApplication, QMainWindow
+from PySide6.QtWidgets import QApplication, QMainWindow, QDialog
 from voice_ui import Ui_project1
 from network import Network
 from audio import AudioEngine
@@ -116,16 +116,16 @@ net.discover()
 
 if not net.server_ip:
     dlg_ip = ServerIPDialog()
-    if dlg_ip.exec_() == dlg_ip.Accepted:
+    if dlg_ip.exec() == QDialog.Accepted:
         net.server_ip = dlg_ip.server_ip
     else:
         sys.exit(0)
 
 audio = AudioEngine()
 dlg = StartupDialog(net.server_ip, audio.port)
-if dlg.exec_() != dlg.Accepted:
+if not dlg.exec():
     sys.exit(0)
 
 w = MainWindow(dlg.client_id, net.server_ip, audio)
 w.show()
-sys.exit(app.exec_())
+sys.exit(app.exec())
