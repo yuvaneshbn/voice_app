@@ -70,6 +70,8 @@ python main.py
 ## Project Structure
 
 - `client/`: Client application files.
+
+https://drive.google.com/drive/folders/1dsLQTv7MZin_437LcpNiiCrt1tE7szNK?usp=drive_link
 - `server/`: Server application files.
 - `requirements.txt`: Python dependencies.
 - `README.md`: This file.
