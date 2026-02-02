@@ -37,7 +37,6 @@ A UDP-based LAN intercom system that allows multiple PCs on the same network to 
 ### Running the Server
 On one PC:
 ```
-cd server
 python server.py
 ```
 The server broadcasts its presence and handles audio routing.
@@ -79,3 +78,50 @@ https://drive.google.com/drive/folders/1dsLQTv7MZin_437LcpNiiCrt1tE7szNK?usp=dri
 ## License
 
 None specified.
+
+## Opus (Windows) - DLL and Packaging Notes
+
+This project uses the native `libopus` library via `ctypes` for low-latency audio.
+On Windows you must provide a matching `opus.dll` (32-bit vs 64-bit must match your
+Python interpreter). The project looks for the DLL in several locations but the
+recommended place is `client/opus/opus.dll`.
+
+Quick steps (development)
+- Use the DLL provided in the project `opus\opus.dll` If not do the Steps below to Download `opus.dll`
+- Download a Windows build of `libopus` that matches your Python bitness: https://github.com/xiph/opus/releases
+- Copy the DLL to `client/opus/opus.dll`.
+- Test import:
+
+```powershell
+python -c "from client.opus_codec import OpusCodec; print('opus OK')"
+```
+
+Helper script
+- A helper is provided to copy and validate a DLL: `tools/install_opus.py`.
+   Usage:
+
+```powershell
+python tools/install_opus.py --src "C:\full\path\to\opus.dll"
+```
+
+PyInstaller / Frozen executable notes
+- For one-file builds, include the DLL in the bundle so our runtime loader can
+   find it under the extracted `_MEI*` folder. Example CLI:
+
+```powershell
+pyinstaller --onefile --windowed --add-binary "C:\full\path\to\opus.dll;opus" client\main.py
+```
+
+- Alternatively, place `opus.dll` at `client/opus/opus.dll` and build with the
+   provided spec; `client/main.spec` was updated to include that file automatically
+   if present:
+
+```powershell
+pyinstaller client\main.spec
+```
+
+Troubleshooting
+- If ctypes reports it cannot load the DLL, check bitness:
+   `python -c "import struct; print(struct.calcsize('P')*8)"`
+- Some Windows builds require Visual C++ redistributables (install the matching
+   VC++ runtime if load fails).

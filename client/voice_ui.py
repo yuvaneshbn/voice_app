@@ -23,9 +23,6 @@ class Ui_project1(object):
         if not project1.objectName():
             project1.setObjectName(u"project1")
         project1.resize(749, 571)
-        icon = QIcon()
-        icon.addFile(u"../../Downloads/technical-support.png", QSize(), QIcon.Mode.Normal, QIcon.State.Off)
-        project1.setWindowIcon(icon)
         self.centralwidget = QWidget(project1)
         self.centralwidget.setObjectName(u"centralwidget")
         self.cl1talkbtn = QPushButton(self.centralwidget)
