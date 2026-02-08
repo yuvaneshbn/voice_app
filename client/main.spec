@@ -4,7 +4,7 @@
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=[('C:\\Users\\YUVANESH\\Desktop\\voice_app\\opus\\opus.dll', 'opus')],
     datas=[],
     hiddenimports=[],
     hookspath=[],
