@@ -8,8 +8,6 @@ import pyaudio
 
 from native_mixer import mix_frames as native_mix_frames
 from native_mixer import native_available
-from native_ringbuffer import NativeRingBuffer
-from native_ringbuffer import native_available as native_ring_available
 from opus_codec import OpusCodec
 
 RATE = 16000
@@ -20,89 +18,97 @@ FRAME_BYTES = FRAME * 2
 DECODE_WORKERS = 2
 DECODE_QUEUE_MAX = 512
 OUTPUT_QUEUE_MAX = 8
-RING_CAPACITY = 128
+
+JITTER_TARGET_FILL = 5
+JITTER_MAX_SIZE = 128
+
 VAD_THRESHOLD = 35
 VAD_HANGOVER_FRAMES = 20
-RING_MAX_MISS_ADVANCE = 3
 
 
-class PythonRingBuffer:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.frames = [None] * capacity
-        self.seqs = [None] * capacity
+def _seq_diff(a, b):
+    # Signed 16-bit sequence distance in range [-32768, 32767].
+    return ((a - b + 32768) & 0xFFFF) - 32768
+
+
+class JitterBuffer:
+    def __init__(self, target_fill=JITTER_TARGET_FILL, max_size=JITTER_MAX_SIZE):
+        self.target_fill = target_fill
+        self.max_size = max_size
+        self.buffer = {}  # seq -> frame bytes
+        self.expected_seq = None
 
     def push(self, seq, frame):
-        idx = seq % self.capacity
-        self.frames[idx] = frame
-        self.seqs[idx] = seq
+        if seq is None:
+            return
 
-    def pop(self, seq):
-        idx = seq % self.capacity
-        if self.seqs[idx] != seq:
+        seq = seq & 0xFFFF
+        if self.expected_seq is None:
+            self.expected_seq = seq
+
+        # Drop frames that are too old relative to expected sequence.
+        if _seq_diff(seq, self.expected_seq) < -self.max_size:
+            return
+
+        self.buffer[seq] = frame
+
+        while len(self.buffer) > self.max_size:
+            # Drop farthest old frame first relative to expected_seq.
+            oldest = min(self.buffer.keys(), key=lambda s: _seq_diff(s, self.expected_seq))
+            del self.buffer[oldest]
+
+    def pop(self):
+        if self.expected_seq is None:
             return None
-        frame = self.frames[idx]
-        self.frames[idx] = None
-        self.seqs[idx] = None
-        return frame
+
+        seq = self.expected_seq
+        if seq in self.buffer:
+            frame = self.buffer.pop(seq)
+            self.expected_seq = (self.expected_seq + 1) & 0xFFFF
+            return frame
+
+        if len(self.buffer) < self.target_fill:
+            return None
+
+        # Buffer has enough frames but expected is missing: assume loss and resync.
+        future = [s for s in self.buffer.keys() if _seq_diff(s, self.expected_seq) >= 0]
+        if future:
+            next_seq = min(future, key=lambda s: _seq_diff(s, self.expected_seq))
+            self.expected_seq = next_seq
+            frame = self.buffer.pop(next_seq)
+            self.expected_seq = (self.expected_seq + 1) & 0xFFFF
+            return frame
+
+        # No future frame found; move one step and let mixer output silence.
+        self.expected_seq = (self.expected_seq + 1) & 0xFFFF
+        return None
+
+    def close(self):
+        self.buffer.clear()
 
 
 class StreamState:
-    def __init__(self, use_native_ring, frame_size):
-        self.expected_seq = None
-        self.legacy_frames = deque(maxlen=RING_CAPACITY)
-        self.has_seq = False
+    def __init__(self, frame_size):
+        del frame_size
+        self.jitter_buffer = JitterBuffer(target_fill=JITTER_TARGET_FILL, max_size=JITTER_MAX_SIZE)
+        self.legacy_frames = deque(maxlen=JITTER_MAX_SIZE)
         self.gain = 1.0
-        self.miss_streak = 0
-
-        self.native_ring = None
-        self.py_ring = None
-
-        if use_native_ring:
-            self.native_ring = NativeRingBuffer(RING_CAPACITY, frame_size)
-        else:
-            self.py_ring = PythonRingBuffer(RING_CAPACITY)
 
     def close(self):
-        if self.native_ring is not None:
-            self.native_ring.close()
+        self.jitter_buffer.close()
 
     def push(self, seq, frame):
         if seq is None:
             self.legacy_frames.append(frame)
             return
-
-        self.has_seq = True
-        if self.expected_seq is None:
-            self.expected_seq = seq
-
-        if self.native_ring is not None:
-            self.native_ring.push(seq, frame)
-        else:
-            self.py_ring.push(seq, frame)
+        self.jitter_buffer.push(seq, frame)
 
     def pop_for_mix(self):
-        if self.has_seq and self.expected_seq is not None:
-            seq = self.expected_seq
-            if self.native_ring is not None:
-                frame = self.native_ring.pop(seq)
-            else:
-                frame = self.py_ring.pop(seq)
-
-            if frame is not None:
-                self.miss_streak = 0
-                self.expected_seq = (self.expected_seq + 1) & 0xFFFF
-                return frame
-
-            self.miss_streak += 1
-            if self.miss_streak >= RING_MAX_MISS_ADVANCE:
-                # Recover from packet loss/gaps without locking playback forever.
-                self.miss_streak = 0
-                self.expected_seq = (self.expected_seq + 1) & 0xFFFF
-
+        frame = self.jitter_buffer.pop()
+        if frame is not None:
+            return frame
         if self.legacy_frames:
             return self.legacy_frames.popleft()
-
         return None
 
 
@@ -120,9 +126,10 @@ class AudioEngine:
         self.port = self.recv_sock.getsockname()[1]
 
         self.running = False
-        self.send_thread = None  # Track the thread explicitly
         self.start_stop_lock = threading.Lock()
+        self.send_thread = None
         self.tx_sock = None
+        self._tx_sock = None
         self.input = None
 
         self.state_lock = threading.Lock()
@@ -140,13 +147,11 @@ class AudioEngine:
         self.vad_hangover = 0
 
         self.use_native_mixer = native_available()
-        self.use_native_ring = native_ring_available()
 
         self.stats = {
             "recv_packets": 0,
             "recv_drops": 0,
             "recv_legacy": 0,
-            "recv_vad_drop": 0,
             "recv_vad_marked": 0,
             "decode_packets": 0,
             "decode_fail": 0,
@@ -164,12 +169,9 @@ class AudioEngine:
         }
 
         print(
-            "[AUDIO] Native mixer {}"
-            .format("enabled" if self.use_native_mixer else "not found, using Python fallback")
-        )
-        print(
-            "[AUDIO] Native ringbuffer {}"
-            .format("enabled" if self.use_native_ring else "not found, using Python ring fallback")
+            "[AUDIO] Native mixer {}".format(
+                "enabled" if self.use_native_mixer else "not found, using Python fallback"
+            )
         )
 
         self.output = self.audio.open(
@@ -193,7 +195,7 @@ class AudioEngine:
         threading.Thread(target=self.mixer_loop, daemon=True, name="audio-mixer").start()
 
     def _new_stream_state(self):
-        return StreamState(self.use_native_ring, FRAME)
+        return StreamState(FRAME)
 
     def set_hear_targets(self, targets):
         with self.state_lock:
@@ -290,15 +292,12 @@ class AudioEngine:
                 continue
 
             if self.client_id and sender_id == self.client_id:
-                # Defensive guard: never play back our own stream if forwarded by mistake.
                 continue
 
             self.stats["recv_packets"] += 1
             if legacy:
                 self.stats["recv_legacy"] += 1
-
             if vad == 0:
-                # Keep VAD as metadata only. Dropping here breaks seq continuity.
                 self.stats["recv_vad_marked"] += 1
 
             self._push_decode_item((sender_id, opus, seq))
@@ -436,10 +435,12 @@ class AudioEngine:
                 return 1
             self.last_vad_flag = 0
             return 0
+
         energy = 0
         for s in samples:
             energy += s * s
         rms = (energy / len(samples)) ** 0.5
+
         if rms > VAD_THRESHOLD:
             self.vad_hangover = VAD_HANGOVER_FRAMES
             vad = 1
@@ -448,6 +449,7 @@ class AudioEngine:
             vad = 1
         else:
             vad = 0
+
         self.last_vad_rms = rms
         self.last_vad_flag = vad
         return vad
@@ -456,6 +458,7 @@ class AudioEngine:
         with self.start_stop_lock:
             if self.running or not self.client_id:
                 return
+
             self.running = True
             print(f"[AUDIO] Audio capture ACTIVE for {self.client_id} -> {server_ip}:50002")
 
@@ -469,19 +472,22 @@ class AudioEngine:
 
             self.tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.tx_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            self._tx_sock = self.tx_sock
 
-        # Reset thread ref before starting new one
-        self.send_thread = None
-
-        def send():
+        def send(local_sock):
             packet_count = 0
             next_status_log = time.monotonic() + 2.0
-            while self.running:
-                # REFINED: Check running BEFORE read() to exit faster on stop
-                if not self.running:
-                    break
+            while True:
+                with self.start_stop_lock:
+                    if not self.running:
+                        break
+                    input_stream = self.input
+                if input_stream is None:
+                    time.sleep(0.01)
+                    continue
+
                 try:
-                    pcm = self.input.read(CHUNK, exception_on_overflow=False)
+                    pcm = input_stream.read(CHUNK, exception_on_overflow=False)
 
                     if hasattr(self, "aec") and self.aec and hasattr(self, "last_played"):
                         try:
@@ -503,9 +509,20 @@ class AudioEngine:
 
                     header = f"{self.client_id}|{seq}|{ts}|{vad}|".encode()
                     packet = header + opus
-                    if self.tx_sock is None:
+
+                    with self.start_stop_lock:
+                        sock = self._tx_sock
+
+                    if sock is None:
                         continue
-                    self.tx_sock.sendto(packet, (server_ip, 50002))
+
+                    try:
+                        sock.sendto(packet, (server_ip, 50002))
+                    except OSError as e:
+                        if not self.running:
+                            break
+                        print(f"[AUDIO] Send error: {e}")
+                        continue
 
                     self.tx_seq = (self.tx_seq + 1) & 0xFFFF
                     self.tx_ts = (self.tx_ts + FRAME) & 0xFFFFFFFF
@@ -531,36 +548,37 @@ class AudioEngine:
                         next_status_log = now + 2.0
                 except Exception as e:
                     print(f"[AUDIO] Send error: {e}")
-                    # Faster exit on fatal errors (e.g., socket closed)
-                    if not self.running:
-                        break
+                    with self.start_stop_lock:
+                        if not self.running:
+                            break
+
             print(f"[AUDIO] Send thread stopped for {self.client_id}")
 
-        self.send_thread = threading.Thread(target=send, daemon=True, name="audio-send")
+        self.send_thread = threading.Thread(target=send, args=(self._tx_sock,), daemon=True, name="audio-send")
         self.send_thread.start()
 
     def stop(self):
         with self.start_stop_lock:
             self.running = False
-            print(f"[AUDIO] Stopping capture for {self.client_id}...")  # DEBUG: Remove if too verbose
+
             if self.input is not None:
                 try:
-                    # REFINED: Stop stream FIRST to unblock any pending read()
                     self.input.stop_stream()
                     self.input.close()
                 except Exception:
                     pass
                 self.input = None
+
             if self.tx_sock is not None:
                 try:
                     self.tx_sock.close()
                 except Exception:
                     pass
                 self.tx_sock = None
+                self._tx_sock = None
 
-            # Wait for send thread to exit cleanly (prevents multiple threads)
-            if self.send_thread is not None and self.send_thread.is_alive():
-                self.send_thread.join(timeout=0.8)  # Slightly longer for safety, but quick
-                if self.send_thread.is_alive():
-                    print(f"[AUDIO] Send thread join timeout for {self.client_id} - forcing daemon exit")
+            thread = self.send_thread
             self.send_thread = None
+
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
