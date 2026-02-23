@@ -109,7 +109,7 @@ PyInstaller / Frozen executable notes
    find it under the extracted `_MEI*` folder. Example CLI:
 
 ```powershell
-pyinstaller --onefile --windowed --add-binary "C:\full\path\to\opus.dll;opus" client\main.py
+pyinstaller --onefile --windowed --add-binary "C:\full\path\to\opus.dll;opus" --add-binary "C:\full\path\to\native_mixer.dll;audio_native" client\main.py
 ```
 
 - Alternatively, place `opus.dll` at `client/opus/opus.dll` and build with the
@@ -119,6 +119,24 @@ pyinstaller --onefile --windowed --add-binary "C:\full\path\to\opus.dll;opus" cl
 ```powershell
 pyinstaller client\main.spec
 ```
+
+## Native Mixer (C++) - Optional but Recommended
+
+The client mixer hot path can run in native C++ for lower CPU usage with many
+simultaneous talkers. The native module sources are under `audio_native/`.
+
+Build on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File audio_native\build_native.ps1
+```
+
+This generates:
+- `audio_native\native_mixer.dll`
+
+Runtime behavior:
+- If DLL exists, client uses native `mix_frames` automatically.
+- If DLL is missing, client falls back to Python mixer logic.
 
 Troubleshooting
 - If ctypes reports it cannot load the DLL, check bitness:

@@ -119,9 +119,9 @@ class MainWindow(QMainWindow):
         if not self.registration_successful:
             return
             
-        if self.targets:
+        if self.targets and not self.audio.running:
             self.audio.start(self.server_ip)
-        else:
+        elif not self.targets and self.audio.running:
             self.audio.stop()
 
         t = ",".join(self.targets)

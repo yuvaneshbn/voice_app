@@ -1,10 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 
+project_root = Path(__file__).resolve().parent.parent
+opus_dll = project_root / "client" / "opus" / "opus.dll"
+native_mixer_dll = project_root / "audio_native" / "native_mixer.dll"
+
+binaries = []
+if opus_dll.exists():
+    binaries.append((str(opus_dll), "opus"))
+if native_mixer_dll.exists():
+    binaries.append((str(native_mixer_dll), "audio_native"))
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[('C:\\Users\\YUVANESH\\Desktop\\projects\\Two-way-switch\\client\\opus\\opus.dll', 'opus')],
+    binaries=binaries,
     datas=[],
     hiddenimports=[],
     hookspath=[],
