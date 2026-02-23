@@ -206,13 +206,6 @@ pyinstaller --onefile --windowed --add-binary "C:\full\path\to\opus.dll;opus" --
   - Confirm `client\opus\opus.dll` exists
   - Check 64-bit Python vs 64-bit DLL compatibility
 
-## GitHub About (Suggested)
-
-Use this in GitHub repository settings -> About:
-
-- Description: `LAN voice intercom with Opus codec, jitter buffer, and optional native C++ mixer`
-- Website: `https://github.com/yuvaneshbn/voice_app`
-- Topics: `voip, udp, opus, pyside6, audio, lan, intercom, realtime-audio, python`
 
 ## License
 
