@@ -1,12 +1,11 @@
-﻿import socket, threading, time
+import socket, threading, time
 
 DISCOVERY_PORT = 50000
 CONTROL_PORT   = 50001
 AUDIO_PORT     = 50002
 
-clients = {}   # client_id -> {ip, port, alive, registered_at}
+clients = {}   # client_id -> (ip, audio_port)
 talking = {}   # client_id -> set(target_ids)
-last_seen = {}  # client_id -> last activity timestamp
 
 
 def broadcast_server():
@@ -17,30 +16,18 @@ def broadcast_server():
         time.sleep(2)
 
 
-def cleanup_inactive():
-    while True:
-        now = time.time()
-        stale = [cid for cid, ts in last_seen.items() if now - ts > 5]
-        for cid in stale:
-            clients.pop(cid, None)
-            talking.pop(cid, None)
-            last_seen.pop(cid, None)
-            print(f"[SERVER] {cid} timed out")
-        time.sleep(1)
-
-
 def control_listener():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("", CONTROL_PORT))
 
-    print("[SERVER] Control listener running")
+    print("🟢 Control listener running")
 
     while True:
         data, addr = s.recvfrom(1024)
         try:
             text = data.decode()
-        except Exception:
+        except:
             continue
 
         # ---------- REGISTER ----------
@@ -50,54 +37,52 @@ def control_listener():
 
             if cid in clients:
                 s.sendto(b"TAKEN", addr)
-                print(f"[SERVER] Client {cid} already in use")
+                print(f"❌ Client {cid} already in use")
                 continue
 
-            clients[cid] = {"ip": addr[0], "port": port, "alive": True, "registered_at": time.time()}
+            clients[cid] = (addr[0], port)
             talking[cid] = set()
-            last_seen[cid] = time.time()
             s.sendto(b"OK", addr)
-            print(f"[SERVER] {cid} registered from {addr[0]} on port {port}")
-            print(f"[SERVER] Registered clients: {clients}")
+            print(f"✅ {cid} registered from {addr[0]} on port {port}")
+            print(f"   Registered clients: {clients}")
 
         # ---------- TALK ----------
         elif text.startswith("TALK:"):
             parts = text.split(":")
             if len(parts) < 3:
-                print(f"[SERVER] Invalid TALK format: {text}")
+                print(f"❌ Invalid TALK format: {text}")
                 continue
-
+            
             cid = parts[1]
             targets_str = parts[2]
 
             if cid not in clients:
-                print(f"[SERVER] TALK from unknown client: {cid} (registered clients: {list(clients.keys())})")
+                print(f"❌ TALK from unknown client: {cid} (registered clients: {list(clients.keys())})")
                 continue
 
             targets = set(targets_str.split(",")) if targets_str.strip() else set()
-            targets.discard("")
-
+            targets.discard("")  # Remove empty strings
+            
+            # Clean up old targets for this client
+            old_targets = talking.get(cid, set())
+            
+            # Update this client's targets
             talking[cid] = targets
-            clients[cid]["alive"] = True
-            last_seen[cid] = time.time()
 
-            print(f"[SERVER] {cid} -> {targets if targets else '(none)'}")
-            print(f"[SERVER] Talking map: {dict((k, list(v)) for k, v in talking.items())}")
+            print(f"[SERVER] 🎙️ {cid} → {targets if targets else '(none)'}")
 
-        # ---------- PING ----------
-        elif text.startswith("PING:"):
-            cid = text.split(":")[1]
-            if cid in clients:
-                clients[cid]["alive"] = True
-                last_seen[cid] = time.time()
+            # IMPORTANT: NO bidirectional routing to avoid corruption
+            # Each client only talks to explicitly selected targets
+
+            print(f"   After bidirectional routing - Talking dict: {dict((k, list(v)) for k, v in talking.items())}")
+
 
         # ---------- UNREGISTER ----------
         elif text.startswith("UNREGISTER:"):
             cid = text.split(":")[1]
             clients.pop(cid, None)
             talking.pop(cid, None)
-            last_seen.pop(cid, None)
-            print(f"[SERVER] {cid} disconnected")
+            print(f"🛑 {cid} disconnected")
 
 
 def audio_router():
@@ -105,81 +90,68 @@ def audio_router():
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind(("", AUDIO_PORT))
 
-    print("[SERVER] Audio router running")
-    packet_count = {}
+    print("🔊 Audio router running")
+    packet_count = {cid: 0 for cid in ['1', '2', '3', '4']}  # Per-client counters
 
     while True:
-        if len(clients) < 2:
-            time.sleep(0.05)
-            continue
-        try:
-            packet, addr = s.recvfrom(4096)
-        except ConnectionResetError:
-            # UDP can raise this on Windows when remote port is unreachable
-            continue
-
+        packet, addr = s.recvfrom(4096)
+        
         # Audio packets are formatted as: client_id:opus_data
         if b":" not in packet:
-            print(f"[SERVER] Malformed packet from {addr}")
+            print(f"❌ Malformed packet from {addr}")
             continue
-
+            
         try:
-            header_bytes, opus_data = packet.split(b":", 1)
-            header = header_bytes.decode(errors="ignore").strip()
-            if "|" not in header:
-                continue
-            # Header is client_id|seq|timestamp; keep only client_id for routing
-            sender = header.split("|", 1)[0]
+            sender_id_bytes, opus_data = packet.split(b":", 1)
+            sender = sender_id_bytes.decode(errors="ignore").strip()
         except Exception as e:
-            print(f"[SERVER] Parse error: {e}")
+            print(f"❌ Parse error: {e}")
             continue
 
         # Track packet counts per sender
-        packet_count[sender] = packet_count.get(sender, 0) + 1
+        if sender in packet_count:
+            packet_count[sender] += 1
+        else:
+            packet_count[sender] = 1
 
         # Check if sender is registered and verify IP
         if sender not in clients:
             if packet_count[sender] % 500 == 1:
-                print(f"[SERVER] Audio from unregistered sender: {sender} (registered: {list(clients.keys())})")
+                print(f"❌ Audio from unregistered sender: {sender} (registered: {list(clients.keys())})")
             continue
-
-        if not clients[sender].get("alive", False):
-            continue
-
-        expected_ip, expected_port = clients[sender]["ip"], clients[sender]["port"]
+        
+        # Verify sender IP matches registered IP
+        expected_ip, expected_port = clients[sender]
         if addr[0] != expected_ip:
             if packet_count[sender] % 100 == 1:
-                print(f"[SERVER] IP mismatch for {sender}: expected {expected_ip}, got {addr[0]}")
+                print(f"❌ IP mismatch for {sender}: expected {expected_ip}, got {addr[0]}")
             continue
-
-        last_seen[sender] = time.time()
-
+        
         if sender not in talking:
-            print(f"[SERVER] {sender} not in talking map (clients: {list(clients.keys())}, talking: {list(talking.keys())})")
+            print(f"❌ {sender} not in talking dict (clients: {list(clients.keys())}, talking: {list(talking.keys())})")
             continue
 
         targets = talking[sender]
-
+        
+        # Log every N packets for each active sender
         if packet_count[sender] % 500 == 1:
-            print(f"[SERVER] Audio #{packet_count[sender]} from {sender} -> targets: {targets if targets else '(no targets)'}")
-
+            print(f"📡 Audio #{packet_count[sender]} from {sender} → targets: {targets if targets else '(no targets - not sending)'}")
+        
         if not targets:
             continue
-
+            
+        # Forward to all targets
         for target in targets:
-            if target == sender:
-                continue
-            if target in clients and clients[target].get("alive", False):
-                ip, port = clients[target]["ip"], clients[target]["port"]
+            if target in clients:
+                ip, port = clients[target]
                 try:
                     s.sendto(packet, (ip, port))
                 except Exception as e:
-                    print(f"[SERVER] Send error to {target}: {e}")
+                    print(f"❌ Send error to {target}: {e}")
             else:
-                print(f"[SERVER] Target {target} not available/alive")
+                print(f"❌ Target {target} not in registered clients {list(clients.keys())}")
 
 
 threading.Thread(target=broadcast_server, daemon=True).start()
 threading.Thread(target=control_listener, daemon=True).start()
-threading.Thread(target=cleanup_inactive, daemon=True).start()
 audio_router()

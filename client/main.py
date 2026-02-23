@@ -1,4 +1,4 @@
-﻿import sys, socket, threading, time
+import sys, socket
 from PySide6.QtWidgets import QApplication, QMainWindow, QDialog
 from voice_ui import Ui_project1
 from network import Network
@@ -63,10 +63,6 @@ class MainWindow(QMainWindow):
         self.ctrl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.ctrl.bind(("", 0))
 
-        self.ping_running = True
-        self.ping_thread = threading.Thread(target=self._ping_loop, daemon=True)
-        self.ping_thread.start()
-
         self.ui.talkbtn.clicked.connect(self.broadcast)
         self.ui.statusbar.showMessage(f"You are Client {self.my_id} - Connected")
 
@@ -90,15 +86,6 @@ class MainWindow(QMainWindow):
             if cid != self.my_id:
                 btn.setEnabled(True)
         self.ui.talkbtn.setEnabled(True)
-
-    def _ping_loop(self):
-        while self.ping_running:
-            try:
-                msg = f"PING:{self.my_id}".encode()
-                self.ctrl.sendto(msg, (self.server_ip, 50001))
-            except Exception:
-                pass
-            time.sleep(2)
 
     def toggle_target(self, cid):
         if cid == self.my_id or not self.registration_successful:
@@ -131,7 +118,7 @@ class MainWindow(QMainWindow):
     def update_targets(self):
         if not self.registration_successful:
             return
-
+            
         if self.targets:
             self.audio.start(self.server_ip)
         else:
@@ -143,10 +130,10 @@ class MainWindow(QMainWindow):
     def broadcast(self):
         if not self.registration_successful:
             return
-
+            
         # Toggle broadcast mode
         all_targets = set(self.talk_buttons.keys()) - {self.my_id}
-
+        
         if self.targets == all_targets:
             # Currently broadcasting - turn it off
             self.targets = set()
@@ -159,103 +146,95 @@ class MainWindow(QMainWindow):
             for c in all_targets:
                 self.talk_buttons[c].setChecked(True)
                 self.talk_buttons[c].setStyleSheet(ACTIVE)
-
+        
         self.update_targets()
 
     def closeEvent(self, event):
         """Clean shutdown - unregister from server"""
-        self.ping_running = False
         try:
             unregister_msg = f"UNREGISTER:{self.my_id}".encode()
             self.ctrl.sendto(unregister_msg, (self.server_ip, 50001))
             print(f"[CLIENT] Sent unregistration: {self.my_id}")
         except Exception as e:
-            print(f"[CLIENT] Unregistration error: {e}")
-
-        try:
-            self.ctrl.close()
-        except Exception:
-            pass
-
-        self.audio.shutdown()
+            print(f"[CLIENT] ❌ Unregistration error: {e}")
+        
+        self.audio.stop()
         event.accept()
-
 
 def register_client_with_server(client_id, server_ip, audio_port):
     """Register client with server BEFORE creating AudioEngine or MainWindow"""
     try:
         ctrl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         ctrl.bind(("", 0))
-
+        
         register_msg = f"REGISTER:{client_id}:{audio_port}".encode()
         ctrl.sendto(register_msg, (server_ip, 50001))
         print(f"[CLIENT] Sent registration: {client_id} on port {audio_port}")
-
+        
         # Wait for response
         ctrl.settimeout(5.0)
         try:
             response, _ = ctrl.recvfrom(1024)
             if response == b"OK":
-                print(f"[CLIENT] Registration successful for client {client_id}")
+                print(f"[CLIENT] ✅ Registration successful for client {client_id}")
                 ctrl.close()
                 return True
             elif response == b"TAKEN":
-                print(f"[CLIENT] Client ID {client_id} already taken")
+                print(f"[CLIENT] ❌ Client ID {client_id} already taken")
                 ctrl.close()
                 return False
             else:
-                print(f"[CLIENT] Unexpected registration response: {response}")
+                print(f"[CLIENT] ⚠️ Unexpected registration response: {response}")
                 ctrl.close()
                 return False
         except socket.timeout:
-            print(f"[CLIENT] Registration timeout for client {client_id}")
+            print(f"[CLIENT] ⚠️ Registration timeout for client {client_id}")
             ctrl.close()
             return False
     except Exception as e:
-        print(f"[CLIENT] Registration error: {e}")
+        print(f"[CLIENT] ❌ Registration error: {e}")
         return False
-
 
 def main():
     print("=" * 50)
-    print("VOICE CHAT CLIENT STARTING")
+    print("🎤 VOICE CHAT CLIENT STARTING")
     print("=" * 50)
-
+    
     app = QApplication(sys.argv)
 
     # Discover server
     net = Network()
-    print("[CLIENT] Discovering server...")
+    print("[CLIENT] 🔍 Discovering server...")
     net.discover()
 
     if not net.server_ip:
-        print("[CLIENT] Server not found, prompting for manual IP...")
+        print("[CLIENT] ❌ Server not found, prompting for manual IP...")
         dlg_ip = ServerIPDialog()
         if dlg_ip.exec() == QDialog.Accepted:
             net.server_ip = dlg_ip.server_ip
-            print(f"[CLIENT] Using manual server IP: {net.server_ip}")
+            print(f"[CLIENT] 📡 Using manual server IP: {net.server_ip}")
         else:
-            print("[CLIENT] User cancelled, exiting")
+            print("[CLIENT] 🛑 User cancelled, exiting")
             sys.exit(0)
     else:
-        print(f"[CLIENT] Server found at: {net.server_ip}")
+        print(f"[CLIENT] ✅ Server found at: {net.server_ip}")
 
     # Get client ID from user FIRST
     dlg = StartupDialog(net.server_ip, 0)  # audio_port not needed yet
     if not dlg.exec():
-        print("[CLIENT] User cancelled client setup, exiting")
+        print("[CLIENT] 🛑 User cancelled client setup, exiting")
         sys.exit(0)
-
+    
     client_id = dlg.client_id
-    print(f"[CLIENT] Selected Client ID: {client_id}")
-
+    print(f"[CLIENT] 👤 Selected Client ID: {client_id}")
+    
     # Create AudioEngine for this client
     audio = AudioEngine()
     audio_port = audio.port
-    print(f"[CLIENT] Audio engine initialized on port {audio_port}")
-
+    print(f"[CLIENT] 🎧 Audio engine initialized on port {audio_port}")
+    
     # REGISTER WITH SERVER BEFORE ANYTHING ELSE
-    print(f"[CLIENT] Registering with server...")
+    print(f"[CLIENT] 🔄 Registering with server...")
     if not register_client_with_server(client_id, net.server_ip, audio_port):
         # Registration failed - show error and exit
         from PySide6.QtWidgets import QMessageBox
@@ -265,21 +244,21 @@ def main():
         msg.setText(f"Client ID {client_id} is already in use or registration failed!")
         msg.setInformativeText("Please choose a different client ID and try again.")
         msg.exec()
-        audio.shutdown()  # Clean up audio
+        audio.stop()  # Clean up audio
         sys.exit(1)
-
+    
     # Registration successful - now create the UI
-    print(f"[CLIENT] Registration successful - starting UI...")
-
+    print(f"[CLIENT] ✅ Registration successful - starting UI...")
+    
     # Main window
     try:
         w = MainWindow(client_id, net.server_ip, audio)
         w.show()
-        print("[CLIENT] Client ready!")
+        print("[CLIENT] ✅ Client ready!")
         sys.exit(app.exec())
     except Exception as e:
-        print(f"[CLIENT] Failed to start main window: {e}")
-        audio.shutdown()
+        print(f"[CLIENT] ❌ Failed to start main window: {e}")
+        audio.stop()
         sys.exit(1)
 
 
