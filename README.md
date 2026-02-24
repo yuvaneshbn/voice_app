@@ -10,6 +10,7 @@ The current implementation is optimized for LAN use and supports:
 - Room-based fallback routing on server
 - Local jitter buffering and decoding on clients
 - Required native mixer for stable multi-stream playback
+- WebRTC AEC3 bridge with runtime fallback suppression when AEC does not converge
 
 ## Table of Contents
 
@@ -138,7 +139,13 @@ cmake -S audio_native -B audio_native\build
 cmake --build audio_native\build --config Release
 ```
 
-AEC3 is vendored at `audio_native\third_party\AEC3` and is required for build.
+AEC3 is vendored at `audio_native\third_party\AEC3` and is required for build/rebuild.
+
+Important:
+
+- Runtime needs `audio_native\native_mixer.dll`.
+- `audio_native\third_party\AEC3` is not required to run if DLL is already built.
+- `audio_native\third_party\AEC3` is required if you want to compile native code again.
 
 After build, confirm the DLL exists at:
 
@@ -257,6 +264,15 @@ Removes client from registry and room.
 - Send thread lifecycle guarded to prevent stale thread races
 - On stop: stream/socket teardown and bounded thread join
 
+### Echo Control Notes
+
+- Native WebRTC APM (AEC3) is enabled through `client/webrtc_apm.py`.
+- If AEC metrics stay unhealthy (low ERLE), client enables guarded fallback suppression.
+- Fallback state appears in TX logs:
+  - `fallback=off` -> not armed
+  - `fallback=armed` -> unhealthy AEC detected, waiting for valid remote-reference conditions
+  - `fallback=active` -> suppression currently applied
+
 ## 11. Build Executables
 
 ### Server
@@ -329,6 +345,14 @@ Practical scaling still depends on:
 
 - Check HEAR buttons for expected senders.
 - Validate server logs show forwarding activity.
+
+### Echo remains high
+
+- Confirm logs show AEC metrics (`erl`, `erle`, `dly`) in TX status.
+- If `erle` stays near `0.2dB`, check fallback status:
+  - `fallback=off` continuously may indicate no remote-reference condition.
+  - `fallback=active` means fallback suppression is engaged.
+- Prefer headphones for best echo performance during testing.
 
 ### Malformed packet logs on server
 
