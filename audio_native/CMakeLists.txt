@@ -6,7 +6,7 @@ add_library(native_mixer SHARED
     mixer.cpp
     agc.cpp
     ringbuffer.cpp
+    webrtc_apm.cpp
 )
 
 target_compile_features(native_mixer PRIVATE cxx_std_17)
-

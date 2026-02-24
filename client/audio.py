@@ -10,6 +10,7 @@ import pyaudio
 from native_mixer import mix_frames as native_mix_frames
 from native_mixer import native_available
 from opus_codec import OpusCodec
+from webrtc_apm import WebRTCApm, apm_available
 
 RATE = 16000
 FRAME = 320  # 20 ms @ 16 kHz (quality-first profile)
@@ -44,6 +45,8 @@ GATE_ATTACK = 0.35
 GATE_RELEASE = 0.05
 ENABLE_ECHO_SUPPRESS = False
 ENABLE_LOWPASS_SMOOTH = False
+ENABLE_WEBRTC_APM = True
+WEBRTC_APM_DELAY_MS = 50
 
 
 def _seq_diff(a, b):
@@ -215,6 +218,16 @@ class AudioEngine:
         if not native_available():
             raise RuntimeError("native_mixer.dll not found. It is required for audio mixing.")
         self.use_native_mixer = True
+        self.webrtc_apm = None
+        if ENABLE_WEBRTC_APM and apm_available():
+            try:
+                self.webrtc_apm = WebRTCApm(RATE, 1, FRAME)
+                self.webrtc_apm.configure(enable_aec3=True, enable_ns=True, enable_agc=False, enable_vad=False)
+                self.webrtc_apm.set_delay_ms(WEBRTC_APM_DELAY_MS)
+                print("[AUDIO] WebRTC APM bridge enabled")
+            except Exception as e:
+                self.webrtc_apm = None
+                print(f"[AUDIO] WebRTC APM bridge unavailable: {e}")
 
         self.stats = {
             "recv_packets": 0,
@@ -292,6 +305,11 @@ class AudioEngine:
                 frame = (frame + (b"\x00" * wanted))[:wanted]
 
             self.last_played = frame
+            if self.webrtc_apm is not None:
+                try:
+                    self.webrtc_apm.process_reverse(frame)
+                except Exception as e:
+                    print(f"[AUDIO] APM reverse error: {e}")
 
             self.stats["callback_calls"] += 1
             self.stats["callback_time_s"] += time.perf_counter() - start
@@ -561,6 +579,12 @@ class AudioEngine:
             self._noise_floor_ema += (rms - self._noise_floor_ema) * alpha_down
 
     def _preprocess_capture(self, pcm_bytes):
+        if self.webrtc_apm is not None:
+            try:
+                pcm_bytes = self.webrtc_apm.process_capture(pcm_bytes)
+            except Exception as e:
+                print(f"[AUDIO] APM capture error: {e}")
+
         # Conservative processing for lower disturbance without heavy dependencies:
         # 1) suppress speaker leakage using current playback frame
         # 2) remove DC/low rumble with a one-pole DC blocker
