@@ -128,8 +128,17 @@ If missing, client raises a startup error and exits.
 ### Build/Rebuild Native Mixer
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File audio_native\build_native.ps1
+.\audio_native\build_native.ps1
 ```
+
+If script execution is restricted on your machine, use:
+
+```powershell
+cmake -S audio_native -B audio_native\build
+cmake --build audio_native\build --config Release
+```
+
+AEC3 is vendored at `audio_native\third_party\AEC3` and is required for build.
 
 After build, confirm the DLL exists at:
 

@@ -67,49 +67,85 @@ EXPORT_API int ringbuffer_pop(void* handle, uint16_t seq, int16_t* outFrame) {
 }
 
 EXPORT_API void* apm_create(int sampleRate, int channels, int frameSize) {
-    if (sampleRate <= 0 || channels <= 0 || frameSize <= 0) {
+    try {
+        if (sampleRate <= 0 || channels <= 0 || frameSize <= 0) {
+            return nullptr;
+        }
+        return new WebRtcApm(sampleRate, channels, frameSize);
+    } catch (...) {
         return nullptr;
     }
-    return new WebRtcApm(sampleRate, channels, frameSize);
 }
 
 EXPORT_API void apm_destroy(void* handle) {
-    if (!handle) {
+    try {
+        if (!handle) {
+            return;
+        }
+        auto* apm = static_cast<WebRtcApm*>(handle);
+        delete apm;
+    } catch (...) {
         return;
     }
-    auto* apm = static_cast<WebRtcApm*>(handle);
-    delete apm;
 }
 
 EXPORT_API int apm_config(void* handle, int enableAec3, int enableNs, int enableAgc, int enableVad) {
-    if (!handle) {
+    try {
+        if (!handle) {
+            return 0;
+        }
+        auto* apm = static_cast<WebRtcApm*>(handle);
+        return apm->configure(enableAec3, enableNs, enableAgc, enableVad);
+    } catch (...) {
         return 0;
     }
-    auto* apm = static_cast<WebRtcApm*>(handle);
-    return apm->configure(enableAec3, enableNs, enableAgc, enableVad);
 }
 
 EXPORT_API int apm_set_delay_ms(void* handle, int delayMs) {
-    if (!handle) {
+    try {
+        if (!handle) {
+            return 0;
+        }
+        auto* apm = static_cast<WebRtcApm*>(handle);
+        return apm->setDelayMs(delayMs);
+    } catch (...) {
         return 0;
     }
-    auto* apm = static_cast<WebRtcApm*>(handle);
-    return apm->setDelayMs(delayMs);
 }
 
 EXPORT_API int apm_process_reverse(void* handle, const int16_t* farFrame, int frameSamples) {
-    if (!handle || !farFrame || frameSamples <= 0) {
+    try {
+        if (!handle || !farFrame || frameSamples <= 0) {
+            return 0;
+        }
+        auto* apm = static_cast<WebRtcApm*>(handle);
+        return apm->processReverse(farFrame, frameSamples);
+    } catch (...) {
         return 0;
     }
-    auto* apm = static_cast<WebRtcApm*>(handle);
-    return apm->processReverse(farFrame, frameSamples);
 }
 
 EXPORT_API int apm_process_capture(void* handle, const int16_t* nearFrame, int frameSamples, int16_t* outFrame) {
-    if (!handle || !nearFrame || !outFrame || frameSamples <= 0) {
+    try {
+        if (!handle || !nearFrame || !outFrame || frameSamples <= 0) {
+            return 0;
+        }
+        auto* apm = static_cast<WebRtcApm*>(handle);
+        return apm->processCapture(nearFrame, frameSamples, outFrame);
+    } catch (...) {
         return 0;
     }
-    auto* apm = static_cast<WebRtcApm*>(handle);
-    return apm->processCapture(nearFrame, frameSamples, outFrame);
+}
+
+EXPORT_API int apm_get_metrics(void* handle, float* erl, float* erle, int* delayMs) {
+    try {
+        if (!handle || !erl || !erle || !delayMs) {
+            return 0;
+        }
+        auto* apm = static_cast<WebRtcApm*>(handle);
+        return apm->getMetrics(erl, erle, delayMs);
+    } catch (...) {
+        return 0;
+    }
 }
 }

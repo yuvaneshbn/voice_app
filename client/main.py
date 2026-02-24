@@ -135,11 +135,10 @@ class MainWindow(QMainWindow):
         if not self.registration_successful:
             return
 
+        # Keep capture thread stable once started; stopping/restarting rapidly on UI
+        # target changes caused send-thread generation churn in practice.
         if self.targets and not self.audio.running:
             self.audio.start(self.server_ip)
-            time.sleep(0.1)
-        elif not self.targets and self.audio.running:
-            self.audio.stop()
 
         targets = ",".join(sorted(self.targets))
         ok, response = send_control_command(self.server_ip, f"TARGETS:{self.my_id}:{targets}")

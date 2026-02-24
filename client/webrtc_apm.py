@@ -1,5 +1,5 @@
 import ctypes
-from ctypes import POINTER, c_int, c_int16, c_void_p
+from ctypes import POINTER, byref, c_float, c_int, c_int16, c_void_p
 
 from native_mixer import _dll as _native_dll
 
@@ -23,6 +23,9 @@ if _native_dll is not None:
     _native_dll.apm_process_capture.argtypes = [c_void_p, POINTER(c_int16), c_int, POINTER(c_int16)]
     _native_dll.apm_process_capture.restype = c_int
 
+    _native_dll.apm_get_metrics.argtypes = [c_void_p, POINTER(c_float), POINTER(c_float), POINTER(c_int)]
+    _native_dll.apm_get_metrics.restype = c_int
+
 
 def apm_available():
     if _native_dll is None:
@@ -36,6 +39,7 @@ def apm_available():
             "apm_set_delay_ms",
             "apm_process_reverse",
             "apm_process_capture",
+            "apm_get_metrics",
         )
     )
 
@@ -90,3 +94,18 @@ class WebRTCApm:
         if not ok:
             return near_frame_bytes
         return ctypes.string_at(out, self.frame_size * 2)
+
+    def get_metrics(self):
+        if not self._handle:
+            return None
+        erl = c_float(0.0)
+        erle = c_float(0.0)
+        delay_ms = c_int(0)
+        ok = _native_dll.apm_get_metrics(self._handle, byref(erl), byref(erle), byref(delay_ms))
+        if not ok:
+            return None
+        return {
+            "erl_db": float(erl.value),
+            "erle_db": float(erle.value),
+            "delay_ms": int(delay_ms.value),
+        }

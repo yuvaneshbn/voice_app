@@ -20,6 +20,7 @@ FRAME_BYTES = FRAME * 2
 DECODE_WORKERS = max(4, (os.cpu_count() or 8) // 2)
 DECODE_QUEUE_MAX = 2048
 OUTPUT_QUEUE_MAX = 48
+OUTPUT_QUEUE_TARGET = 3
 INPUT_QUEUE_MAX = 128
 
 JITTER_TARGET_FILL = 10
@@ -27,10 +28,10 @@ JITTER_MAX_SIZE = 256
 JITTER_TARGET_MIN = 8
 JITTER_TARGET_MAX = 14
 
-VAD_THRESHOLD = 35
-VAD_HANGOVER_FRAMES = 20
-NOISE_GATE_RMS = 70.0
-NOISE_GATE_ATTACK_RMS = 180.0
+VAD_THRESHOLD = 24
+VAD_HANGOVER_FRAMES = 28
+NOISE_GATE_RMS = 45.0
+NOISE_GATE_ATTACK_RMS = 130.0
 DC_BLOCK_R = 0.995
 ECHO_ATTENUATE_GAIN = 0.65
 ECHO_SUPPRESS_MIN_RMS = 300.0
@@ -40,13 +41,21 @@ OPUS_TX_BITRATE = 32000
 OPUS_TX_COMPLEXITY = 10
 PLC_DECAY = 0.85
 UNDERRUN_DECAY = 0.90
-GATE_MIN_GAIN = 0.08
-GATE_ATTACK = 0.35
-GATE_RELEASE = 0.05
+GATE_MIN_GAIN = 0.28
+GATE_ATTACK = 0.55
+GATE_RELEASE = 0.15
 ENABLE_ECHO_SUPPRESS = False
 ENABLE_LOWPASS_SMOOTH = False
 ENABLE_WEBRTC_APM = True
 WEBRTC_APM_DELAY_MS = 50
+APPLY_SOFT_GATE_WITH_APM = False
+ENABLE_AEC_FALLBACK_SUPPRESS = True
+AEC_FALLBACK_ERLE_THRESHOLD_DB = 2.0
+AEC_FALLBACK_TRIGGER_WINDOWS = 2
+AEC_FALLBACK_MIN_REF_RMS = 140.0
+AEC_FALLBACK_SUBTRACT_ALPHA = 0.55
+AEC_FALLBACK_RESIDUAL_GAIN = 0.55
+AEC_FALLBACK_REMOTE_ACTIVE_SEC = 1.2
 
 
 def _seq_diff(a, b):
@@ -214,6 +223,12 @@ class AudioEngine:
         self._adapt_prev_miss = 0
         self._adapt_prev_callback = 0
         self._adapt_prev_underrun = 0
+        self._next_apm_metrics_log = time.monotonic() + 5.0
+        self._apm_error_count = 0
+        self._aec_unhealthy = False
+        self._aec_unhealthy_windows = 0
+        self._last_remote_audio_ts = 0.0
+        self._fallback_active = False
 
         if not native_available():
             raise RuntimeError("native_mixer.dll not found. It is required for audio mixing.")
@@ -310,6 +325,10 @@ class AudioEngine:
                     self.webrtc_apm.process_reverse(frame)
                 except Exception as e:
                     print(f"[AUDIO] APM reverse error: {e}")
+                    self._apm_error_count += 1
+                    if self._apm_error_count >= 8:
+                        print("[AUDIO] Disabling WebRTC APM after repeated native errors")
+                        self.webrtc_apm = None
 
             self.stats["callback_calls"] += 1
             self.stats["callback_time_s"] += time.perf_counter() - start
@@ -410,6 +429,7 @@ class AudioEngine:
                 continue
 
             self.stats["recv_packets"] += 1
+            self._last_remote_audio_ts = time.monotonic()
             if legacy:
                 self.stats["recv_legacy"] += 1
             if vad == 0:
@@ -494,6 +514,12 @@ class AudioEngine:
         next_deadline = time.perf_counter()
 
         while True:
+            # Keep playout buffer shallow to reduce end-to-end delay and help AEC alignment.
+            if self.output_queue.qsize() >= OUTPUT_QUEUE_TARGET:
+                time.sleep(frame_interval * 0.5)
+                next_deadline = time.perf_counter()
+                continue
+
             frame, active = self._mix_ready_frames()
             self._push_output_frame(frame)
 
@@ -582,8 +608,18 @@ class AudioEngine:
         if self.webrtc_apm is not None:
             try:
                 pcm_bytes = self.webrtc_apm.process_capture(pcm_bytes)
+                self._apm_error_count = 0
             except Exception as e:
                 print(f"[AUDIO] APM capture error: {e}")
+                # Native APM faults can become persistent once internal state is corrupted.
+                # Disable immediately to keep call audio alive.
+                self._apm_error_count += 1
+                print("[AUDIO] Disabling WebRTC APM after native capture error")
+                try:
+                    self.webrtc_apm.close()
+                except Exception:
+                    pass
+                self.webrtc_apm = None
 
         # Conservative processing for lower disturbance without heavy dependencies:
         # 1) suppress speaker leakage using current playback frame
@@ -591,6 +627,25 @@ class AudioEngine:
         # 3) simple noise gate on very low-level background noise
         mic_out = bytearray(pcm_bytes)
         mic = memoryview(mic_out).cast("h")
+
+        # Fallback suppression path for cases where AEC is running but not converging.
+        fallback_active = False
+        if (
+            ENABLE_AEC_FALLBACK_SUPPRESS
+            and self._aec_unhealthy
+            and len(self.last_played) == len(pcm_bytes)
+        ):
+            remote_recent = (time.monotonic() - self._last_remote_audio_ts) <= AEC_FALLBACK_REMOTE_ACTIVE_SEC
+            ref = memoryview(self.last_played).cast("h")
+            ref_rms = self._rms_from_samples(ref)
+            mic_rms = self._rms_from_samples(mic)
+            if remote_recent and ref_rms >= AEC_FALLBACK_MIN_REF_RMS and ref_rms > (mic_rms * 0.75):
+                fallback_active = True
+                for i in range(FRAME):
+                    estimate = int(ref[i] * AEC_FALLBACK_SUBTRACT_ALPHA)
+                    residual = mic[i] - estimate
+                    mic[i] = self._clamp_i16(int(residual * AEC_FALLBACK_RESIDUAL_GAIN))
+        self._fallback_active = fallback_active
 
         if ENABLE_ECHO_SUPPRESS and len(self.last_played) == len(pcm_bytes):
             ref = memoryview(self.last_played).cast("h")
@@ -626,7 +681,7 @@ class AudioEngine:
         dynamic_floor = max(NOISE_GATE_RMS, self._noise_floor_ema * 1.8)
 
         # Soft gate envelope avoids hard on/off chopping and click noise.
-        open_thr = max(NOISE_GATE_ATTACK_RMS, dynamic_floor * 1.6)
+        open_thr = max(NOISE_GATE_ATTACK_RMS, dynamic_floor * 1.35)
         close_thr = dynamic_floor
         if rms >= open_thr:
             desired_gain = 1.0
@@ -641,7 +696,7 @@ class AudioEngine:
         else:
             self._gate_gain += (desired_gain - self._gate_gain) * GATE_RELEASE
 
-        if self._gate_gain < 0.999:
+        if self._gate_gain < 0.999 and (self.webrtc_apm is None or APPLY_SOFT_GATE_WITH_APM):
             for i in range(FRAME):
                 mic[i] = self._clamp_i16(int(mic[i] * self._gate_gain))
 
@@ -776,8 +831,44 @@ class AudioEngine:
 
                     now = time.monotonic()
                     if now >= next_status_log:
+                        apm_info = ""
+                        if self.webrtc_apm is not None and now >= self._next_apm_metrics_log:
+                            try:
+                                m = self.webrtc_apm.get_metrics()
+                                if m is not None:
+                                    prev_unhealthy = self._aec_unhealthy
+                                    remote_recent = (
+                                        time.monotonic() - self._last_remote_audio_ts
+                                    ) <= AEC_FALLBACK_REMOTE_ACTIVE_SEC
+                                    if remote_recent and m["erle_db"] < AEC_FALLBACK_ERLE_THRESHOLD_DB:
+                                        self._aec_unhealthy_windows += 1
+                                    else:
+                                        self._aec_unhealthy_windows = 0
+                                    self._aec_unhealthy = (
+                                        self._aec_unhealthy_windows >= AEC_FALLBACK_TRIGGER_WINDOWS
+                                    )
+                                    if self._aec_unhealthy != prev_unhealthy:
+                                        state = "ON" if self._aec_unhealthy else "OFF"
+                                        print(
+                                            "[AUDIO] AEC fallback {} (erle={:.1f}dB, erl={:.1f}dB, dly={}ms)"
+                                            .format(
+                                                state,
+                                                m["erle_db"],
+                                                m["erl_db"],
+                                                m["delay_ms"],
+                                            )
+                                        )
+                                    apm_info = " aec(erl={:.1f}dB erle={:.1f}dB dly={}ms)".format(
+                                        m["erl_db"],
+                                        m["erle_db"],
+                                        m["delay_ms"],
+                                    )
+                            except Exception as e:
+                                apm_info = f" aec(err={e})"
+                            self._next_apm_metrics_log = now + 5.0
+
                         print(
-                            "[AUDIO] TX status active={} rms={:.1f} vad={} voice={} silence={} sent={}"
+                            "[AUDIO] TX status active={} rms={:.1f} vad={} voice={} silence={} sent={}{}"
                             .format(
                                 self.running,
                                 self.last_vad_rms,
@@ -785,6 +876,7 @@ class AudioEngine:
                                 self.stats["tx_vad_voice"],
                                 self.stats["tx_vad_silence"],
                                 self.stats["tx_packets"],
+                                apm_info + f" fallback={'active' if self._fallback_active else ('armed' if self._aec_unhealthy else 'off')}",
                             )
                         )
                         next_status_log = now + 2.0
