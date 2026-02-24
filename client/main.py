@@ -202,7 +202,13 @@ def register_client_with_server(client_id, server_ip, audio_port):
 
 
 def main():
-    faulthandler.enable(all_threads=True)
+    # In PyInstaller windowed builds, sys.stderr can be None.
+    # Guard faulthandler to avoid RuntimeError: "sys.stderr is None".
+    if sys.stderr is not None:
+        try:
+            faulthandler.enable(all_threads=True)
+        except Exception:
+            pass
     print("=" * 50)
     print("VOICE CHAT CLIENT STARTING")
     print("=" * 50)
