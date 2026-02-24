@@ -1,0 +1,8 @@
+PySide6
+pyaudio==0.2.13
+
+PyAudio-0.2.14-cp311-cp311-win_amd64.whl
+pyside6_addons-6.10.1-cp39-abi3-win_amd64.whl
+pyside6_essentials-6.10.1-cp39-abi3-win_amd64.whl
+pyside6-6.10.1-cp39-abi3-win_amd64.whl
+shiboken6-6.10.1-cp39-abi3-win_amd64.whl

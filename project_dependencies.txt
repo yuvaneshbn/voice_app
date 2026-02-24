@@ -1,0 +1,28 @@
+# Required packages and their specifications
+PySide6 (latest)
+pyaudio==0.2.13
+
+# All imports used in the project
+import sys, socket
+from PySide6.QtWidgets import QApplication, QMainWindow
+from voice_ui import Ui_project1
+from network import Network
+from audio import AudioEngine
+from startup_dialog import StartupDialog, ServerIPDialog
+from PySide6.QtWidgets import QDialog, QPushButton, QVBoxLayout, QLabel, QMessageBox, QLineEdit, QHBoxLayout
+import socket
+import threading
+import time
+from PySide6.QtCore import (QCoreApplication, QDate, QDateTime, QLocale,
+    QMetaObject, QObject, QPoint, QRect,
+    QSize, QTime, QUrl, Qt)
+from PySide6.QtGui import (QBrush, QColor, QConicalGradient, QCursor,
+    QFont, QFontDatabase, QGradient, QIcon,
+    QImage, QKeySequence, QLinearGradient, QPainter,
+    QPalette, QPixmap, QRadialGradient, QTransform)
+from PySide6.QtWidgets import (QApplication, QLabel, QMainWindow, QPushButton,
+    QSizePolicy, QStatusBar, QWidget)
+import socket, threading
+from network import Network
+import socket
+import socket, threading, pyaudio

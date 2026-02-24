@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller
+build/
+dist/
+*.spec
+*.toc
+*.pkg
+*.pyz
+base_library.zip
+warn-*.txt
+xref-*.html
+
+# Executables
+*.exe
+*.dll
+!audio_native/native_mixer.dll
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
