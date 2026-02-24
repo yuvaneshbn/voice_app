@@ -32,6 +32,10 @@ else:
 
 OPUS_APPLICATION_VOIP = 2048
 OPUS_OK = 0
+OPUS_SET_BITRATE_REQUEST = 4002
+OPUS_SET_COMPLEXITY_REQUEST = 4010
+OPUS_SET_INBAND_FEC_REQUEST = 4012
+OPUS_SET_PACKET_LOSS_PERC_REQUEST = 4014
 
 opus.opus_encoder_create.restype = c_void_p
 opus.opus_encoder_create.argtypes = [c_int, c_int, c_int, POINTER(c_int)]
@@ -58,6 +62,8 @@ opus.opus_decode.argtypes = [
     c_int,
 ]
 
+opus.opus_encoder_ctl.restype = c_int
+
 
 class OpusCodec:
     """Minimal Opus wrapper tuned for 20ms @ 16 kHz, mono.
@@ -66,7 +72,16 @@ class OpusCodec:
     decode(opus_bytes) -> pcm bytes (16-bit little-endian)
     """
 
-    def __init__(self, rate=16000, channels=1, frame_size=320):
+    def __init__(
+        self,
+        rate=16000,
+        channels=1,
+        frame_size=320,
+        enable_fec=False,
+        packet_loss_perc=0,
+        bitrate=16000,
+        complexity=10,
+    ):
         self.frame_size = frame_size
 
         err = c_int()
@@ -79,6 +94,22 @@ class OpusCodec:
         self.decoder = opus.opus_decoder_create(rate, channels, ctypes.byref(err))
         if not self.decoder:
             raise RuntimeError("Opus decoder creation failed")
+
+        if bitrate > 0:
+            self._set_encoder_ctl_int(OPUS_SET_BITRATE_REQUEST, bitrate)
+        if complexity >= 0:
+            self._set_encoder_ctl_int(OPUS_SET_COMPLEXITY_REQUEST, complexity)
+        self._set_encoder_ctl_int(OPUS_SET_INBAND_FEC_REQUEST, 1 if enable_fec else 0)
+        if packet_loss_perc > 0:
+            self._set_encoder_ctl_int(OPUS_SET_PACKET_LOSS_PERC_REQUEST, packet_loss_perc)
+
+    def _set_encoder_ctl_int(self, request, value):
+        try:
+            rc = opus.opus_encoder_ctl(self.encoder, c_int(request), c_int(value))
+            if rc != OPUS_OK:
+                print(f"[OPUS] encoder_ctl request={request} value={value} rc={rc}")
+        except Exception as e:
+            print(f"[OPUS] encoder_ctl unavailable request={request}: {e}")
 
     def encode(self, pcm_bytes):
         # Expect exactly frame_size * 2 bytes (int16)

@@ -31,7 +31,7 @@ EXPORT_API void mix_frames(
         mixer.addStream(stream, gain);
     }
 
-    mixer.mix(output);
+    mixer.mix(output, numStreams);
 }
 
 EXPORT_API void* ringbuffer_create(int capacity, int frameSize) {

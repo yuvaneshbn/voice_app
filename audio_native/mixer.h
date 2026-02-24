@@ -9,7 +9,7 @@ public:
     explicit AudioMixer(int frameSize);
     void reset();
     void addStream(const int16_t* samples, float gain);
-    void mix(int16_t* output);
+    void mix(int16_t* output, int activeStreams);
 
 private:
     int frameSize;

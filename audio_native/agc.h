@@ -5,12 +5,12 @@
 
 class SimpleAGC {
 public:
-    explicit SimpleAGC(float targetPeak = 12000.0f);
+    explicit SimpleAGC(float targetRMS = 3000.0f);
     float process(const int16_t* samples, int frameSize);
 
 private:
-    float emaLevel;
-    float targetPeak;
+    float targetRMS;
+    float gain;
 };
 
 #endif

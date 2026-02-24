@@ -12,19 +12,32 @@ from native_mixer import native_available
 from opus_codec import OpusCodec
 
 RATE = 16000
-FRAME = 320  # 20 ms @ 16 kHz
+FRAME = 160  # 10 ms @ 16 kHz
 CHUNK = FRAME
 FRAME_BYTES = FRAME * 2
 
 DECODE_WORKERS = max(4, (os.cpu_count() or 8) // 2)
 DECODE_QUEUE_MAX = 2048
-OUTPUT_QUEUE_MAX = 32
+OUTPUT_QUEUE_MAX = 16
+INPUT_QUEUE_MAX = 128
 
-JITTER_TARGET_FILL = 12
-JITTER_MAX_SIZE = 512
+JITTER_TARGET_FILL = 6
+JITTER_MAX_SIZE = 256
+JITTER_TARGET_MIN = 4
+JITTER_TARGET_MAX = 8
 
 VAD_THRESHOLD = 35
 VAD_HANGOVER_FRAMES = 20
+NOISE_GATE_RMS = 80.0
+NOISE_GATE_ATTACK_RMS = 160.0
+DC_BLOCK_R = 0.995
+ECHO_ATTENUATE_GAIN = 0.5
+ECHO_SUPPRESS_MIN_RMS = 300.0
+OPUS_TX_ENABLE_FEC = True
+OPUS_TX_PACKET_LOSS_PERC = 10
+OPUS_TX_BITRATE = 16000
+OPUS_TX_COMPLEXITY = 10
+PLC_DECAY = 0.85
 
 
 def _seq_diff(a, b):
@@ -89,11 +102,12 @@ class JitterBuffer:
 
 
 class StreamState:
-    def __init__(self, frame_size):
+    def __init__(self, frame_size, target_fill):
         del frame_size
-        self.jitter_buffer = JitterBuffer(target_fill=JITTER_TARGET_FILL, max_size=JITTER_MAX_SIZE)
+        self.jitter_buffer = JitterBuffer(target_fill=target_fill, max_size=JITTER_MAX_SIZE)
         self.legacy_frames = deque(maxlen=JITTER_MAX_SIZE)
         self.gain = 1.0
+        self.last_frame = None
 
     def close(self):
         self.jitter_buffer.close()
@@ -107,9 +121,19 @@ class StreamState:
     def pop_for_mix(self):
         frame = self.jitter_buffer.pop()
         if frame is not None:
+            self.last_frame = frame
             return frame
         if self.legacy_frames:
-            return self.legacy_frames.popleft()
+            frame = self.legacy_frames.popleft()
+            self.last_frame = frame
+            return frame
+        if self.last_frame:
+            plc = bytearray(self.last_frame)
+            samples = memoryview(plc).cast("h")
+            for i in range(len(samples)):
+                samples[i] = int(samples[i] * PLC_DECAY)
+            self.last_frame = bytes(plc)
+            return self.last_frame
         return None
 
 
@@ -118,7 +142,15 @@ class AudioEngine:
         self.client_id = None
         self.audio = pyaudio.PyAudio()
 
-        self.tx_codec = OpusCodec(rate=RATE, channels=1, frame_size=FRAME)
+        self.tx_codec = OpusCodec(
+            rate=RATE,
+            channels=1,
+            frame_size=FRAME,
+            enable_fec=OPUS_TX_ENABLE_FEC,
+            packet_loss_perc=OPUS_TX_PACKET_LOSS_PERC,
+            bitrate=OPUS_TX_BITRATE,
+            complexity=OPUS_TX_COMPLEXITY,
+        )
 
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -140,6 +172,7 @@ class AudioEngine:
 
         self.decode_queue = queue.Queue(maxsize=DECODE_QUEUE_MAX)
         self.output_queue = queue.Queue(maxsize=OUTPUT_QUEUE_MAX)
+        self.input_queue = queue.Queue(maxsize=INPUT_QUEUE_MAX)
 
         self.tx_seq = 0
         self.tx_ts = 0
@@ -147,6 +180,13 @@ class AudioEngine:
         self.last_vad_rms = 0.0
         self.last_vad_flag = 0
         self.vad_hangover = 0
+        self._dc_prev_x = 0.0
+        self._dc_prev_y = 0.0
+        self.dynamic_jitter_target = JITTER_TARGET_FILL
+        self._adapt_prev_mixed = 0
+        self._adapt_prev_miss = 0
+        self._adapt_prev_callback = 0
+        self._adapt_prev_underrun = 0
 
         if not native_available():
             raise RuntimeError("native_mixer.dll not found. It is required for audio mixing.")
@@ -170,6 +210,7 @@ class AudioEngine:
             "tx_packets": 0,
             "tx_vad_voice": 0,
             "tx_vad_silence": 0,
+            "input_queue_drops": 0,
         }
 
         print("[AUDIO] Native mixer enabled")
@@ -195,7 +236,7 @@ class AudioEngine:
         threading.Thread(target=self.mixer_loop, daemon=True, name="audio-mixer").start()
 
     def _new_stream_state(self):
-        return StreamState(FRAME)
+        return StreamState(FRAME, self.dynamic_jitter_target)
 
     def set_hear_targets(self, targets):
         with self.state_lock:
@@ -238,6 +279,24 @@ class AudioEngine:
             )
 
         return (frame, pyaudio.paContinue)
+
+    def _input_callback(self, in_data, frame_count, time_info, status):
+        del frame_count, time_info, status
+        if in_data is None:
+            return (None, pyaudio.paContinue)
+        try:
+            self.input_queue.put_nowait(in_data)
+        except queue.Full:
+            self.stats["input_queue_drops"] += 1
+            try:
+                self.input_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.input_queue.put_nowait(in_data)
+            except queue.Full:
+                self.stats["input_queue_drops"] += 1
+        return (None, pyaudio.paContinue)
 
     def _push_decode_item(self, item):
         try:
@@ -378,6 +437,7 @@ class AudioEngine:
 
             self.stats["mixed_frames"] += 1
             self.stats["mixed_sources"] += active
+            self._adapt_jitter_target()
 
             if self.stats["mixed_frames"] % 1000 == 0:
                 avg_sources = self.stats["mixed_sources"] / max(1, self.stats["mixed_frames"])
@@ -430,10 +490,103 @@ class AudioEngine:
         self.last_vad_flag = vad
         return vad
 
+    @staticmethod
+    def _clamp_i16(v):
+        if v > 32767:
+            return 32767
+        if v < -32768:
+            return -32768
+        return v
+
+    @staticmethod
+    def _rms_from_samples(samples):
+        if not samples:
+            return 0.0
+        energy = 0
+        for s in samples:
+            energy += s * s
+        return (energy / len(samples)) ** 0.5
+
+    def _preprocess_capture(self, pcm_bytes):
+        # Conservative processing for lower disturbance without heavy dependencies:
+        # 1) suppress speaker leakage using current playback frame
+        # 2) remove DC/low rumble with a one-pole DC blocker
+        # 3) simple noise gate on very low-level background noise
+        mic_out = bytearray(pcm_bytes)
+        mic = memoryview(mic_out).cast("h")
+
+        if len(self.last_played) == len(pcm_bytes):
+            ref = memoryview(self.last_played).cast("h")
+            ref_rms = self._rms_from_samples(ref)
+            mic_rms = self._rms_from_samples(mic)
+            if ref_rms >= ECHO_SUPPRESS_MIN_RMS and ref_rms > (mic_rms * 0.8):
+                for i in range(FRAME):
+                    mic[i] = self._clamp_i16(int(mic[i] * ECHO_ATTENUATE_GAIN))
+
+        prev_x = self._dc_prev_x
+        prev_y = self._dc_prev_y
+        for i in range(FRAME):
+            x = float(mic[i])
+            y = x - prev_x + (DC_BLOCK_R * prev_y)
+            prev_x = x
+            prev_y = y
+            mic[i] = self._clamp_i16(int(y))
+        self._dc_prev_x = prev_x
+        self._dc_prev_y = prev_y
+
+        rms = self._rms_from_samples(mic)
+        if rms < NOISE_GATE_RMS:
+            return b"\x00" * len(pcm_bytes)
+        if rms < NOISE_GATE_ATTACK_RMS:
+            gain = 0.7
+            for i in range(FRAME):
+                mic[i] = self._clamp_i16(int(mic[i] * gain))
+
+        return bytes(mic_out)
+
+    def _adapt_jitter_target(self):
+        mixed_now = self.stats["mixed_frames"]
+        window = mixed_now - self._adapt_prev_mixed
+        if window < 200:
+            return
+
+        miss_now = self.stats["mixed_miss"]
+        cb_now = self.stats["callback_calls"]
+        underrun_now = self.stats["callback_underrun"]
+
+        miss_delta = miss_now - self._adapt_prev_miss
+        cb_delta = cb_now - self._adapt_prev_callback
+        underrun_delta = underrun_now - self._adapt_prev_underrun
+        underrun_rate = underrun_delta / max(1, cb_delta)
+
+        new_target = self.dynamic_jitter_target
+        if underrun_rate > 0.05 or miss_delta > int(window * 0.60):
+            new_target = min(JITTER_TARGET_MAX, new_target + 1)
+        elif underrun_rate < 0.01 and miss_delta < int(window * 0.15):
+            new_target = max(JITTER_TARGET_MIN, new_target - 1)
+
+        if new_target != self.dynamic_jitter_target:
+            self.dynamic_jitter_target = new_target
+            with self.state_lock:
+                for state in self.stream_buffers.values():
+                    state.jitter_buffer.target_fill = new_target
+            print(f"[AUDIO] Adaptive jitter target -> {new_target}")
+
+        self._adapt_prev_mixed = mixed_now
+        self._adapt_prev_miss = miss_now
+        self._adapt_prev_callback = cb_now
+        self._adapt_prev_underrun = underrun_now
+
     def start(self, server_ip):
         with self.start_stop_lock:
             if self.running or not self.client_id:
                 return
+
+            while not self.input_queue.empty():
+                try:
+                    self.input_queue.get_nowait()
+                except queue.Empty:
+                    break
 
             self._send_generation += 1
             generation = self._send_generation
@@ -446,7 +599,9 @@ class AudioEngine:
                 rate=RATE,
                 input=True,
                 frames_per_buffer=CHUNK,
+                stream_callback=self._input_callback,
             )
+            self.input.start_stream()
 
             self.tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.tx_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
@@ -466,7 +621,15 @@ class AudioEngine:
                     continue
 
                 try:
-                    pcm = input_stream.read(CHUNK, exception_on_overflow=False)
+                    try:
+                        pcm = self.input_queue.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+
+                    if len(pcm) != FRAME_BYTES:
+                        pcm = (pcm + (b"\x00" * FRAME_BYTES))[:FRAME_BYTES]
+
+                    pcm = self._preprocess_capture(pcm)
 
                     if hasattr(self, "aec") and self.aec and hasattr(self, "last_played"):
                         try:

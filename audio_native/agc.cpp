@@ -3,28 +3,33 @@
 #include <algorithm>
 #include <cmath>
 
-SimpleAGC::SimpleAGC(float targetPeak) : emaLevel(1000.0f), targetPeak(targetPeak) {}
+SimpleAGC::SimpleAGC(float targetRMS) : targetRMS(targetRMS), gain(1.0f) {}
 
 float SimpleAGC::process(const int16_t* samples, int frameSize) {
     if (!samples || frameSize <= 0) {
-        return 1.0f;
+        return gain;
     }
 
-    int16_t peak = 0;
+    double energy = 0.0;
     for (int i = 0; i < frameSize; ++i) {
-        peak = std::max<int16_t>(peak, static_cast<int16_t>(std::abs(samples[i])));
+        const double s = static_cast<double>(samples[i]);
+        energy += s * s;
     }
 
-    emaLevel = 0.9f * emaLevel + 0.1f * static_cast<float>(peak);
-    if (emaLevel < 1.0f) {
-        emaLevel = 1.0f;
+    float rms = static_cast<float>(std::sqrt(energy / frameSize));
+    if (rms < 1.0f) {
+        rms = 1.0f;
     }
 
-    float gain = targetPeak / emaLevel;
-    if (gain < 0.25f) {
-        gain = 0.25f;
-    } else if (gain > 4.0f) {
-        gain = 4.0f;
+    const float desired = targetRMS / rms;
+    const float attack = 0.2f;
+    const float release = 0.02f;
+    if (desired > gain) {
+        gain += (desired - gain) * attack;
+    } else {
+        gain += (desired - gain) * release;
     }
-    return gain;
+
+    gain = std::clamp(gain, 0.3f, 3.0f);
+    return this->gain;
 }

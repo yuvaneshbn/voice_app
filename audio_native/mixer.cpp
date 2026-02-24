@@ -28,12 +28,14 @@ void AudioMixer::addStream(const int16_t* samples, float gain) {
     }
 }
 
-void AudioMixer::mix(int16_t* output) {
+void AudioMixer::mix(int16_t* output, int activeStreams) {
     if (!output) {
         return;
     }
 
+    const float norm = (activeStreams > 1) ? (1.0f / static_cast<float>(activeStreams)) : 1.0f;
     for (int i = 0; i < frameSize; ++i) {
-        output[i] = clamp32(accumulator[i]);
+        const int32_t v = static_cast<int32_t>(accumulator[i] * norm);
+        output[i] = clamp32(v);
     }
 }
