@@ -2,6 +2,8 @@ import faulthandler
 import socket
 import sys
 import time
+import threading
+import traceback
 
 from PySide6.QtWidgets import QApplication, QDialog, QMainWindow
 
@@ -202,13 +204,37 @@ def register_client_with_server(client_id, server_ip, audio_port):
 
 
 def main():
-    # In PyInstaller windowed builds, sys.stderr can be None.
-    # Guard faulthandler to avoid RuntimeError: "sys.stderr is None".
-    if sys.stderr is not None:
+    crash_log = None
+    try:
+        crash_log = open("client_crash.log", "a", encoding="utf-8")
+    except Exception:
+        crash_log = None
+
+    def _log_unhandled(exc_type, exc_value, exc_tb):
+        line = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
         try:
-            faulthandler.enable(all_threads=True)
+            if crash_log is not None:
+                crash_log.write("\n=== Unhandled Exception ===\n")
+                crash_log.write(line)
+                crash_log.flush()
         except Exception:
             pass
+        if sys.__stderr__ is not None:
+            sys.__stderr__.write(line)
+
+    def _thread_excepthook(args):
+        _log_unhandled(args.exc_type, args.exc_value, args.exc_traceback)
+
+    sys.excepthook = _log_unhandled
+    threading.excepthook = _thread_excepthook
+
+    try:
+        if crash_log is not None:
+            faulthandler.enable(file=crash_log, all_threads=True)
+        elif sys.stderr is not None:
+            faulthandler.enable(all_threads=True)
+    except Exception:
+        pass
     print("=" * 50)
     print("VOICE CHAT CLIENT STARTING")
     print("=" * 50)

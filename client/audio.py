@@ -12,32 +12,38 @@ from native_mixer import native_available
 from opus_codec import OpusCodec
 
 RATE = 16000
-FRAME = 160  # 10 ms @ 16 kHz
+FRAME = 320  # 20 ms @ 16 kHz (quality-first profile)
 CHUNK = FRAME
 FRAME_BYTES = FRAME * 2
 
 DECODE_WORKERS = max(4, (os.cpu_count() or 8) // 2)
 DECODE_QUEUE_MAX = 2048
-OUTPUT_QUEUE_MAX = 16
+OUTPUT_QUEUE_MAX = 48
 INPUT_QUEUE_MAX = 128
 
-JITTER_TARGET_FILL = 6
+JITTER_TARGET_FILL = 10
 JITTER_MAX_SIZE = 256
-JITTER_TARGET_MIN = 4
-JITTER_TARGET_MAX = 8
+JITTER_TARGET_MIN = 8
+JITTER_TARGET_MAX = 14
 
 VAD_THRESHOLD = 35
 VAD_HANGOVER_FRAMES = 20
-NOISE_GATE_RMS = 80.0
-NOISE_GATE_ATTACK_RMS = 160.0
+NOISE_GATE_RMS = 70.0
+NOISE_GATE_ATTACK_RMS = 180.0
 DC_BLOCK_R = 0.995
-ECHO_ATTENUATE_GAIN = 0.5
+ECHO_ATTENUATE_GAIN = 0.65
 ECHO_SUPPRESS_MIN_RMS = 300.0
 OPUS_TX_ENABLE_FEC = True
 OPUS_TX_PACKET_LOSS_PERC = 10
-OPUS_TX_BITRATE = 16000
+OPUS_TX_BITRATE = 32000
 OPUS_TX_COMPLEXITY = 10
 PLC_DECAY = 0.85
+UNDERRUN_DECAY = 0.90
+GATE_MIN_GAIN = 0.08
+GATE_ATTACK = 0.35
+GATE_RELEASE = 0.05
+ENABLE_ECHO_SUPPRESS = False
+ENABLE_LOWPASS_SMOOTH = False
 
 
 def _seq_diff(a, b):
@@ -108,6 +114,7 @@ class StreamState:
         self.legacy_frames = deque(maxlen=JITTER_MAX_SIZE)
         self.gain = 1.0
         self.last_frame = None
+        self.plc_active = False
 
     def close(self):
         self.jitter_buffer.close()
@@ -121,11 +128,23 @@ class StreamState:
     def pop_for_mix(self):
         frame = self.jitter_buffer.pop()
         if frame is not None:
+            if self.last_frame is not None and self.plc_active:
+                old = memoryview(self.last_frame).cast("h")
+                new = memoryview(frame).cast("h")
+                blended = bytearray(len(frame))
+                out = memoryview(blended).cast("h")
+                for i in range(len(out)):
+                    out[i] = int(old[i] * 0.3 + new[i] * 0.7)
+                self.last_frame = bytes(blended)
+                self.plc_active = False
+                return self.last_frame
             self.last_frame = frame
+            self.plc_active = False
             return frame
         if self.legacy_frames:
             frame = self.legacy_frames.popleft()
             self.last_frame = frame
+            self.plc_active = False
             return frame
         if self.last_frame:
             plc = bytearray(self.last_frame)
@@ -133,6 +152,7 @@ class StreamState:
             for i in range(len(samples)):
                 samples[i] = int(samples[i] * PLC_DECAY)
             self.last_frame = bytes(plc)
+            self.plc_active = True
             return self.last_frame
         return None
 
@@ -150,6 +170,7 @@ class AudioEngine:
             packet_loss_perc=OPUS_TX_PACKET_LOSS_PERC,
             bitrate=OPUS_TX_BITRATE,
             complexity=OPUS_TX_COMPLEXITY,
+            enable_dtx=True,
         )
 
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -182,6 +203,9 @@ class AudioEngine:
         self.vad_hangover = 0
         self._dc_prev_x = 0.0
         self._dc_prev_y = 0.0
+        self._lp_prev = 0.0
+        self._noise_floor_ema = 55.0
+        self._gate_gain = 1.0
         self.dynamic_jitter_target = JITTER_TARGET_FILL
         self._adapt_prev_mixed = 0
         self._adapt_prev_miss = 0
@@ -247,56 +271,70 @@ class AudioEngine:
                     del self.stream_buffers[sid]
 
     def _callback(self, in_data, frame_count, *_):
-        del in_data
-        start = time.perf_counter()
-
-        wanted = frame_count * 2
-        frame = b"\x00" * wanted
         try:
-            frame = self.output_queue.get_nowait()
-        except queue.Empty:
-            self.stats["callback_underrun"] += 1
+            del in_data
+            start = time.perf_counter()
 
-        if len(frame) != wanted:
-            frame = (frame + (b"\x00" * wanted))[:wanted]
+            wanted = frame_count * 2
+            frame = b"\x00" * wanted
+            try:
+                frame = self.output_queue.get_nowait()
+            except queue.Empty:
+                self.stats["callback_underrun"] += 1
+                if len(self.last_played) == wanted:
+                    degraded = bytearray(self.last_played)
+                    samples = memoryview(degraded).cast("h")
+                    for i in range(len(samples)):
+                        samples[i] = int(samples[i] * UNDERRUN_DECAY)
+                    frame = bytes(degraded)
 
-        self.last_played = frame
+            if len(frame) != wanted:
+                frame = (frame + (b"\x00" * wanted))[:wanted]
 
-        self.stats["callback_calls"] += 1
-        self.stats["callback_time_s"] += time.perf_counter() - start
+            self.last_played = frame
 
-        if self.stats["callback_calls"] % 1000 == 0:
-            avg_ms = (self.stats["callback_time_s"] / self.stats["callback_calls"]) * 1000.0
-            print(
-                "[AUDIO] callback_avg_ms={:.4f} underrun={} recv={} decode={} mixed={}"
-                .format(
-                    avg_ms,
-                    self.stats["callback_underrun"],
-                    self.stats["recv_packets"],
-                    self.stats["decode_packets"],
-                    self.stats["mixed_frames"],
+            self.stats["callback_calls"] += 1
+            self.stats["callback_time_s"] += time.perf_counter() - start
+
+            if self.stats["callback_calls"] % 1000 == 0:
+                avg_ms = (self.stats["callback_time_s"] / self.stats["callback_calls"]) * 1000.0
+                print(
+                    "[AUDIO] callback_avg_ms={:.4f} underrun={} recv={} decode={} mixed={}"
+                    .format(
+                        avg_ms,
+                        self.stats["callback_underrun"],
+                        self.stats["recv_packets"],
+                        self.stats["decode_packets"],
+                        self.stats["mixed_frames"],
+                    )
                 )
-            )
 
-        return (frame, pyaudio.paContinue)
+            return (frame, pyaudio.paContinue)
+        except Exception as e:
+            print(f"[AUDIO] Output callback error: {e}")
+            return (b"\x00" * (frame_count * 2), pyaudio.paContinue)
 
     def _input_callback(self, in_data, frame_count, time_info, status):
-        del frame_count, time_info, status
-        if in_data is None:
-            return (None, pyaudio.paContinue)
         try:
-            self.input_queue.put_nowait(in_data)
-        except queue.Full:
-            self.stats["input_queue_drops"] += 1
-            try:
-                self.input_queue.get_nowait()
-            except queue.Empty:
-                pass
+            del frame_count, time_info, status
+            if in_data is None:
+                return (None, pyaudio.paContinue)
             try:
                 self.input_queue.put_nowait(in_data)
             except queue.Full:
                 self.stats["input_queue_drops"] += 1
-        return (None, pyaudio.paContinue)
+                try:
+                    self.input_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    self.input_queue.put_nowait(in_data)
+                except queue.Full:
+                    self.stats["input_queue_drops"] += 1
+            return (None, pyaudio.paContinue)
+        except Exception as e:
+            print(f"[AUDIO] Input callback error: {e}")
+            return (None, pyaudio.paContinue)
 
     def _push_decode_item(self, item):
         try:
@@ -362,7 +400,13 @@ class AudioEngine:
             self._push_decode_item((sender_id, opus, seq))
 
     def decode_worker(self, worker_id):
-        codec = OpusCodec(rate=RATE, channels=1, frame_size=FRAME)
+        codec = OpusCodec(
+            rate=RATE,
+            channels=1,
+            frame_size=FRAME,
+            create_encoder=False,
+            create_decoder=True,
+        )
         while True:
             try:
                 sender_id, opus, seq = self.decode_queue.get(timeout=1.0)
@@ -507,6 +551,15 @@ class AudioEngine:
             energy += s * s
         return (energy / len(samples)) ** 0.5
 
+    def _update_noise_floor(self, rms):
+        # Track a stable background floor; react slower upward than downward.
+        alpha_up = 0.005
+        alpha_down = 0.02
+        if rms > self._noise_floor_ema:
+            self._noise_floor_ema += (rms - self._noise_floor_ema) * alpha_up
+        else:
+            self._noise_floor_ema += (rms - self._noise_floor_ema) * alpha_down
+
     def _preprocess_capture(self, pcm_bytes):
         # Conservative processing for lower disturbance without heavy dependencies:
         # 1) suppress speaker leakage using current playback frame
@@ -515,7 +568,7 @@ class AudioEngine:
         mic_out = bytearray(pcm_bytes)
         mic = memoryview(mic_out).cast("h")
 
-        if len(self.last_played) == len(pcm_bytes):
+        if ENABLE_ECHO_SUPPRESS and len(self.last_played) == len(pcm_bytes):
             ref = memoryview(self.last_played).cast("h")
             ref_rms = self._rms_from_samples(ref)
             mic_rms = self._rms_from_samples(mic)
@@ -534,13 +587,39 @@ class AudioEngine:
         self._dc_prev_x = prev_x
         self._dc_prev_y = prev_y
 
-        rms = self._rms_from_samples(mic)
-        if rms < NOISE_GATE_RMS:
-            return b"\x00" * len(pcm_bytes)
-        if rms < NOISE_GATE_ATTACK_RMS:
-            gain = 0.7
+        if ENABLE_LOWPASS_SMOOTH:
+            # One-pole low-pass smoothing to suppress high-frequency hiss.
+            prev = self._lp_prev
             for i in range(FRAME):
-                mic[i] = self._clamp_i16(int(mic[i] * gain))
+                cur = float(mic[i])
+                smoothed = (0.6 * prev) + (0.4 * cur)
+                mic[i] = self._clamp_i16(int(smoothed))
+                prev = smoothed
+            self._lp_prev = prev
+
+        rms = self._rms_from_samples(mic)
+        self._update_noise_floor(rms)
+        dynamic_floor = max(NOISE_GATE_RMS, self._noise_floor_ema * 1.8)
+
+        # Soft gate envelope avoids hard on/off chopping and click noise.
+        open_thr = max(NOISE_GATE_ATTACK_RMS, dynamic_floor * 1.6)
+        close_thr = dynamic_floor
+        if rms >= open_thr:
+            desired_gain = 1.0
+        elif rms <= close_thr:
+            desired_gain = GATE_MIN_GAIN
+        else:
+            ratio = (rms - close_thr) / max(1.0, open_thr - close_thr)
+            desired_gain = GATE_MIN_GAIN + ((1.0 - GATE_MIN_GAIN) * ratio)
+
+        if desired_gain > self._gate_gain:
+            self._gate_gain += (desired_gain - self._gate_gain) * GATE_ATTACK
+        else:
+            self._gate_gain += (desired_gain - self._gate_gain) * GATE_RELEASE
+
+        if self._gate_gain < 0.999:
+            for i in range(FRAME):
+                mic[i] = self._clamp_i16(int(mic[i] * self._gate_gain))
 
         return bytes(mic_out)
 
