@@ -24,3 +24,7 @@ xref-*.html
 
 # OS
 .DS_Store
+
+# Client logs
+client/*.log
+client/client_crash.log
