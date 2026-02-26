@@ -12,11 +12,7 @@ if (NOT EXISTS "${TWOWAY_AEC3_DIR}/api/echo_canceller3_factory.h")
 endif()
 
 add_library(native_mixer SHARED
-    bindings.cpp
     echo_cancel.cpp
-    mixer.cpp
-    agc.cpp
-    ringbuffer.cpp
     webrtc_apm.cpp
 )
 
