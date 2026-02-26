@@ -1,16 +1,9 @@
 ﻿import socket, threading, pyaudio, struct, math, time
 from opus_codec import OpusCodec
-# New Windows-friendly processing libraries
-try:
-    from pyaec import EchoCanceller
-    from pyrnnoise import RNNoise
-    _HAS_NEW_PROC = True
-except ImportError:
-    print("[AUDIO] Critical: pyaec or pyrnnoise not found. Run: pip install pyaec pyrnnoise")
-    _HAS_NEW_PROC = False
+from echo_cancel import EchoCanceller, echo_cancel_available
 
-RATE  = 16000
-FRAME = 320        # 20 ms @ 16 kHz (matches OpusCodec default)
+RATE = 16000
+FRAME = 320  # 20 ms @ 16 kHz (matches OpusCodec default)
 CHUNK = FRAME
 FRAME_MS = int(1000 * FRAME / RATE)
 AUDIO_PORT = 50002
@@ -28,11 +21,6 @@ MAX_FRAMES = max(2, JITTER_MAX_MS // FRAME_MS)
 TARGET_PEAK = 12000
 MAX_GAIN = 3.0
 MIN_GAIN = 0.5
-
-# Processing Toggles
-ENABLE_AEC = True   # pyaec (SpeexDSP)
-ENABLE_NS = True    # pyrnnoise (RNNoise)
-VAD_THRESHOLD = 0.6 # Speech probability threshold (0.0 - 1.0)
 
 
 class AudioEngine:
@@ -68,16 +56,22 @@ class AudioEngine:
         self.stream_lock = threading.Lock()
         self.multicast_sock = None
         self.multicast_group = None
+        self.input = None
+        self.send_sock = None
+        self.send_thread = None
 
-        self.aec = None
-        self.denoiser = None
-        if _HAS_NEW_PROC:
+        self.echo = None
+        self.echo_enabled = False
+        if echo_cancel_available():
             try:
-                self.aec = EchoCanceller.create(FRAME, 1600, RATE)
-                self.denoiser = RNNoise(sample_rate=RATE)
-            except Exception:
-                self.aec = None
-                self.denoiser = None
+                self.echo = EchoCanceller(sample_rate=RATE, channels=1, frame_size=FRAME, delay_ms=60)
+                self.echo_enabled = True
+                print("[AUDIO] Native echo cancellation enabled")
+            except Exception as e:
+                print(f"[AUDIO] Native echo cancellation unavailable: {e}")
+        else:
+            print("[AUDIO] Native echo cancellation API not found in native_mixer.dll")
+
         self.last_playout = b"\x00" * (FRAME * 2)
         self.seq = 0
         self.timestamp = 0
@@ -90,7 +84,7 @@ class AudioEngine:
             rate=RATE,
             output=True,
             frames_per_buffer=CHUNK,
-            stream_callback=self._callback
+            stream_callback=self._callback,
         )
         self.output.start_stream()
 
@@ -121,6 +115,12 @@ class AudioEngine:
         frame_bytes = frame_count * 2
         mixed_pcm = self.mix(frame_bytes)
         self.last_playout = mixed_pcm
+        if self.echo_enabled and self.echo is not None:
+            try:
+                self.echo.process_reverse(mixed_pcm)
+            except Exception as e:
+                print(f"[AUDIO] Echo reverse error, disabling echo canceller: {e}")
+                self.echo_enabled = False
         return (mixed_pcm, pyaudio.paContinue)
 
     # --------------------------------------------------
@@ -202,13 +202,10 @@ class AudioEngine:
         def soft_clip(x):
             return int(32767 * math.tanh(x / 32767.0))
 
-        output_bytes = struct.pack(
-            "<" + "h" * len(samples),
-            *[soft_clip(s) for s in samples]
-        )
+        output_bytes = struct.pack("<" + "h" * len(samples), *[soft_clip(s) for s in samples])
 
         # Limit logging to avoid spam
-        if not hasattr(self, '_mix_count'):
+        if not hasattr(self, "_mix_count"):
             self._mix_count = 0
         self._mix_count += 1
         if self._mix_count % 1000 == 0:
@@ -390,7 +387,7 @@ class AudioEngine:
             channels=1,
             rate=RATE,
             input=True,
-            frames_per_buffer=CHUNK
+            frames_per_buffer=CHUNK,
         )
 
         self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -401,40 +398,30 @@ class AudioEngine:
             while self.running:
                 try:
                     pcm = self.input.read(CHUNK, exception_on_overflow=False)
-
-                    # 1) AEC
-                    if ENABLE_AEC and self.aec:
+                    if self.echo_enabled and self.echo is not None:
                         try:
-                            pcm = self.aec.process(pcm, self.last_playout)
-                        except Exception:
-                            self.aec = None
+                            pcm = self.echo.process_capture(pcm)
+                        except Exception as e:
+                            print(f"[AUDIO] Echo capture error, disabling echo canceller: {e}")
+                            self.echo_enabled = False
 
-                    # 2) Noise suppression + VAD
-                    is_speech = True
-                    if ENABLE_NS and self.denoiser:
-                        try:
-                            half = len(pcm) // 2
-                            h1, h2 = pcm[:half], pcm[half:]
-                            prob1, d1 = self.denoiser.denoise_frame(h1)
-                            prob2, d2 = self.denoiser.denoise_frame(h2)
-                            pcm = d1 + d2
-                            is_speech = (prob1 + prob2) / 2 > VAD_THRESHOLD
-                        except Exception:
-                            pass
-
-                    # 3) Encode and send
-                    if is_speech:
-                        opus = self.codec.encode(pcm)
-                        if opus:
-                            header = f"{self.client_id}|{self.seq}|{self.timestamp}".encode()
-                            packet = header + b":" + opus
-                            self.seq = (self.seq + 1) & 0xFFFF
-                            self.timestamp += FRAME
-                            self.send_sock.sendto(packet, (server_ip, 50002))
-                            packet_count += 1
-                            if packet_count % 100 == 0:
-                                print(f"[AUDIO] Sent {packet_count} packets from {self.client_id}")
+                    opus = self.codec.encode(pcm)
+                    if opus:
+                        if not self.running or self.send_sock is None:
+                            break
+                        header = f"{self.client_id}|{self.seq}|{self.timestamp}".encode()
+                        packet = header + b":" + opus
+                        self.seq = (self.seq + 1) & 0xFFFF
+                        self.timestamp += FRAME
+                        self.send_sock.sendto(packet, (server_ip, 50002))
+                        packet_count += 1
+                        if packet_count % 100 == 0:
+                            print(f"[AUDIO] Sent {packet_count} packets from {self.client_id}")
                 except Exception as e:
+                    if not self.running:
+                        break
+                    if isinstance(e, OSError) and getattr(e, "winerror", None) == 10038:
+                        break
                     print(f"[AUDIO] Send error: {e}")
 
         self.send_thread = threading.Thread(target=send, daemon=True)
@@ -445,17 +432,21 @@ class AudioEngine:
     def stop(self):
         # Stop capture only (keep receive/output alive)
         self.running = False
+        if self.send_thread and self.send_thread.is_alive():
+            self.send_thread.join(timeout=1.0)
 
         try:
-            if hasattr(self, "input"):
+            if self.input is not None:
                 self.input.stop_stream()
                 self.input.close()
+                self.input = None
         except Exception:
             pass
 
         try:
-            if hasattr(self, "send_sock"):
+            if self.send_sock is not None:
                 self.send_sock.close()
+                self.send_sock = None
         except Exception:
             pass
 
@@ -464,6 +455,13 @@ class AudioEngine:
         self.running = False
         self.listen_running = False
         self.leave_multicast()
+        if self.echo is not None:
+            try:
+                self.echo.close()
+            except Exception:
+                pass
+            self.echo = None
+            self.echo_enabled = False
 
         try:
             self.recv_sock.close()
@@ -480,4 +478,3 @@ class AudioEngine:
             self.audio.terminate()
         except Exception:
             pass
-

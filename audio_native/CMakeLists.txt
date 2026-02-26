@@ -13,6 +13,7 @@ endif()
 
 add_library(native_mixer SHARED
     bindings.cpp
+    echo_cancel.cpp
     mixer.cpp
     agc.cpp
     ringbuffer.cpp
