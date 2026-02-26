@@ -1,172 +1,38 @@
-import queue
-import socket
-import threading
-import time
-from collections import deque
-import os
-
-import pyaudio
-
-from native_mixer import mix_frames as native_mix_frames
-from native_mixer import native_available
+﻿import socket, threading, pyaudio, struct, math, time
 from opus_codec import OpusCodec
-from webrtc_apm import WebRTCApm, apm_available
+# New Windows-friendly processing libraries
+try:
+    from pyaec import EchoCanceller
+    from pyrnnoise import RNNoise
+    _HAS_NEW_PROC = True
+except ImportError:
+    print("[AUDIO] Critical: pyaec or pyrnnoise not found. Run: pip install pyaec pyrnnoise")
+    _HAS_NEW_PROC = False
 
-RATE = 16000
-FRAME = 320  # 20 ms @ 16 kHz (quality-first profile)
+RATE  = 16000
+FRAME = 320        # 20 ms @ 16 kHz (matches OpusCodec default)
 CHUNK = FRAME
-FRAME_BYTES = FRAME * 2
+FRAME_MS = int(1000 * FRAME / RATE)
+AUDIO_PORT = 50002
 
-DECODE_WORKERS = max(4, (os.cpu_count() or 8) // 2)
-DECODE_QUEUE_MAX = 2048
-OUTPUT_QUEUE_MAX = 48
-OUTPUT_QUEUE_TARGET = 3
-INPUT_QUEUE_MAX = 128
+# Simple jitter buffer targets (ms)
+JITTER_MIN_MS = 20
+JITTER_TARGET_MS = 60
+JITTER_MAX_MS = 120
 
-JITTER_TARGET_FILL = 10
-JITTER_MAX_SIZE = 256
-JITTER_TARGET_MIN = 8
-JITTER_TARGET_MAX = 14
+MIN_FRAMES = max(1, JITTER_MIN_MS // FRAME_MS)
+TARGET_FRAMES = max(1, JITTER_TARGET_MS // FRAME_MS)
+MAX_FRAMES = max(2, JITTER_MAX_MS // FRAME_MS)
 
-VAD_THRESHOLD = 24
-VAD_HANGOVER_FRAMES = 28
-NOISE_GATE_RMS = 45.0
-NOISE_GATE_ATTACK_RMS = 130.0
-DC_BLOCK_R = 0.995
-ECHO_ATTENUATE_GAIN = 0.65
-ECHO_SUPPRESS_MIN_RMS = 300.0
-OPUS_TX_ENABLE_FEC = True
-OPUS_TX_PACKET_LOSS_PERC = 10
-OPUS_TX_BITRATE = 32000
-OPUS_TX_COMPLEXITY = 10
-PLC_DECAY = 0.85
-UNDERRUN_DECAY = 0.90
-GATE_MIN_GAIN = 0.28
-GATE_ATTACK = 0.55
-GATE_RELEASE = 0.15
-ENABLE_ECHO_SUPPRESS = False
-ENABLE_LOWPASS_SMOOTH = False
-ENABLE_WEBRTC_APM = True
-WEBRTC_APM_DELAY_MS = 50
-APPLY_SOFT_GATE_WITH_APM = False
-ENABLE_AEC_FALLBACK_SUPPRESS = True
-AEC_FALLBACK_ERLE_THRESHOLD_DB = 2.0
-AEC_FALLBACK_TRIGGER_WINDOWS = 2
-AEC_FALLBACK_MIN_REF_RMS = 140.0
-AEC_FALLBACK_SUBTRACT_ALPHA = 0.55
-AEC_FALLBACK_RESIDUAL_GAIN = 0.55
-AEC_FALLBACK_REMOTE_ACTIVE_SEC = 1.2
+# Per-stream AGC targets
+TARGET_PEAK = 12000
+MAX_GAIN = 3.0
+MIN_GAIN = 0.5
 
-
-def _seq_diff(a, b):
-    # Signed 16-bit sequence distance in range [-32768, 32767].
-    return ((a - b + 32768) & 0xFFFF) - 32768
-
-
-class JitterBuffer:
-    def __init__(self, target_fill=JITTER_TARGET_FILL, max_size=JITTER_MAX_SIZE):
-        self.target_fill = target_fill
-        self.max_size = max_size
-        self.buffer = {}  # seq -> frame bytes
-        self.expected_seq = None
-
-    def push(self, seq, frame):
-        if seq is None:
-            return
-
-        seq = seq & 0xFFFF
-        if self.expected_seq is None:
-            self.expected_seq = seq
-
-        # Drop frames that are too old relative to expected sequence.
-        if _seq_diff(seq, self.expected_seq) < -self.max_size:
-            return
-
-        self.buffer[seq] = frame
-
-        while len(self.buffer) > self.max_size:
-            # Drop farthest old frame first relative to expected_seq.
-            oldest = min(self.buffer.keys(), key=lambda s: _seq_diff(s, self.expected_seq))
-            del self.buffer[oldest]
-
-    def pop(self):
-        if self.expected_seq is None:
-            return None
-
-        seq = self.expected_seq
-        if seq in self.buffer:
-            frame = self.buffer.pop(seq)
-            self.expected_seq = (self.expected_seq + 1) & 0xFFFF
-            return frame
-
-        if len(self.buffer) < self.target_fill:
-            return None
-
-        # Buffer has enough frames but expected is missing: assume loss and resync.
-        future = [s for s in self.buffer.keys() if _seq_diff(s, self.expected_seq) >= 0]
-        if future:
-            next_seq = min(future, key=lambda s: _seq_diff(s, self.expected_seq))
-            self.expected_seq = next_seq
-            frame = self.buffer.pop(next_seq)
-            self.expected_seq = (self.expected_seq + 1) & 0xFFFF
-            return frame
-
-        # No future frame found; move one step and let mixer output silence.
-        self.expected_seq = (self.expected_seq + 1) & 0xFFFF
-        return None
-
-    def close(self):
-        self.buffer.clear()
-
-
-class StreamState:
-    def __init__(self, frame_size, target_fill):
-        del frame_size
-        self.jitter_buffer = JitterBuffer(target_fill=target_fill, max_size=JITTER_MAX_SIZE)
-        self.legacy_frames = deque(maxlen=JITTER_MAX_SIZE)
-        self.gain = 1.0
-        self.last_frame = None
-        self.plc_active = False
-
-    def close(self):
-        self.jitter_buffer.close()
-
-    def push(self, seq, frame):
-        if seq is None:
-            self.legacy_frames.append(frame)
-            return
-        self.jitter_buffer.push(seq, frame)
-
-    def pop_for_mix(self):
-        frame = self.jitter_buffer.pop()
-        if frame is not None:
-            if self.last_frame is not None and self.plc_active:
-                old = memoryview(self.last_frame).cast("h")
-                new = memoryview(frame).cast("h")
-                blended = bytearray(len(frame))
-                out = memoryview(blended).cast("h")
-                for i in range(len(out)):
-                    out[i] = int(old[i] * 0.3 + new[i] * 0.7)
-                self.last_frame = bytes(blended)
-                self.plc_active = False
-                return self.last_frame
-            self.last_frame = frame
-            self.plc_active = False
-            return frame
-        if self.legacy_frames:
-            frame = self.legacy_frames.popleft()
-            self.last_frame = frame
-            self.plc_active = False
-            return frame
-        if self.last_frame:
-            plc = bytearray(self.last_frame)
-            samples = memoryview(plc).cast("h")
-            for i in range(len(samples)):
-                samples[i] = int(samples[i] * PLC_DECAY)
-            self.last_frame = bytes(plc)
-            self.plc_active = True
-            return self.last_frame
-        return None
+# Processing Toggles
+ENABLE_AEC = True   # pyaec (SpeexDSP)
+ENABLE_NS = True    # pyrnnoise (RNNoise)
+VAD_THRESHOLD = 0.6 # Speech probability threshold (0.0 - 1.0)
 
 
 class AudioEngine:
@@ -174,753 +40,444 @@ class AudioEngine:
         self.client_id = None
         self.audio = pyaudio.PyAudio()
 
-        self.tx_codec = OpusCodec(
-            rate=RATE,
-            channels=1,
-            frame_size=FRAME,
-            enable_fec=OPUS_TX_ENABLE_FEC,
-            packet_loss_perc=OPUS_TX_PACKET_LOSS_PERC,
-            bitrate=OPUS_TX_BITRATE,
-            complexity=OPUS_TX_COMPLEXITY,
-            enable_dtx=True,
-        )
+        # Opus codec (frame size MUST match)
+        self.codec = OpusCodec(rate=RATE, channels=1, frame_size=FRAME)
 
+        # ================= RECEIVE SOCKET =================
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+        self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+
+        # Bind to ephemeral port
         self.recv_sock.bind(("", 0))
         self.port = self.recv_sock.getsockname()[1]
 
-        self.running = False
-        self.start_stop_lock = threading.Lock()
-        self.send_thread = None
-        self.tx_sock = None
-        self._tx_sock = None
-        self.input = None
-        self._send_generation = 0
-
-        self.state_lock = threading.Lock()
+        # ================= AUDIO STATE =================
+        self.streams = {}          # sender_id -> dict(seq -> (timestamp, pcm, arrival_time))
+        self.expected_seq = {}     # sender_id -> next seq
+        self.playout_ts = {}       # sender_id -> expected timestamp (samples)
+        self.jitter_target = {}    # sender_id -> target frames
+        self.jitter_est = {}       # sender_id -> jitter estimate (seconds)
+        self.last_arrival = {}     # sender_id -> last arrival time
+        self.last_adjust = {}      # sender_id -> last adjust time
+        self.stream_levels = {}    # sender_id -> float (EMA of peak)
         self.hear_targets = set()
-        self.stream_buffers = {}
+        self.running = False
+        self.listen_running = True
+        self.multicast_running = False
+        self.stream_lock = threading.Lock()
+        self.multicast_sock = None
+        self.multicast_group = None
 
-        self.decode_queue = queue.Queue(maxsize=DECODE_QUEUE_MAX)
-        self.output_queue = queue.Queue(maxsize=OUTPUT_QUEUE_MAX)
-        self.input_queue = queue.Queue(maxsize=INPUT_QUEUE_MAX)
-
-        self.tx_seq = 0
-        self.tx_ts = 0
-        self.last_played = b"\x00" * FRAME_BYTES
-        self.last_vad_rms = 0.0
-        self.last_vad_flag = 0
-        self.vad_hangover = 0
-        self._dc_prev_x = 0.0
-        self._dc_prev_y = 0.0
-        self._lp_prev = 0.0
-        self._noise_floor_ema = 55.0
-        self._gate_gain = 1.0
-        self.dynamic_jitter_target = JITTER_TARGET_FILL
-        self._adapt_prev_mixed = 0
-        self._adapt_prev_miss = 0
-        self._adapt_prev_callback = 0
-        self._adapt_prev_underrun = 0
-        self._next_apm_metrics_log = time.monotonic() + 5.0
-        self._apm_error_count = 0
-        self._aec_unhealthy = False
-        self._aec_unhealthy_windows = 0
-        self._last_remote_audio_ts = 0.0
-        self._fallback_active = False
-
-        if not native_available():
-            raise RuntimeError("native_mixer.dll not found. It is required for audio mixing.")
-        self.use_native_mixer = True
-        self.webrtc_apm = None
-        if ENABLE_WEBRTC_APM and apm_available():
+        self.aec = None
+        self.denoiser = None
+        if _HAS_NEW_PROC:
             try:
-                self.webrtc_apm = WebRTCApm(RATE, 1, FRAME)
-                self.webrtc_apm.configure(enable_aec3=True, enable_ns=True, enable_agc=False, enable_vad=False)
-                self.webrtc_apm.set_delay_ms(WEBRTC_APM_DELAY_MS)
-                print("[AUDIO] WebRTC APM bridge enabled")
-            except Exception as e:
-                self.webrtc_apm = None
-                print(f"[AUDIO] WebRTC APM bridge unavailable: {e}")
+                self.aec = EchoCanceller.create(FRAME, 1600, RATE)
+                self.denoiser = RNNoise(sample_rate=RATE)
+            except Exception:
+                self.aec = None
+                self.denoiser = None
+        self.last_playout = b"\x00" * (FRAME * 2)
+        self.seq = 0
+        self.timestamp = 0
+        self.jitter_stats = {"missing": 0, "received": 0}
 
-        self.stats = {
-            "recv_packets": 0,
-            "recv_drops": 0,
-            "recv_legacy": 0,
-            "recv_vad_marked": 0,
-            "decode_packets": 0,
-            "decode_fail": 0,
-            "mixed_frames": 0,
-            "mixed_sources": 0,
-            "mixed_miss": 0,
-            "callback_calls": 0,
-            "callback_underrun": 0,
-            "callback_time_s": 0.0,
-            "native_mix_used": 0,
-            "python_mix_used": 0,
-            "tx_packets": 0,
-            "tx_vad_voice": 0,
-            "tx_vad_silence": 0,
-            "input_queue_drops": 0,
-        }
-
-        print("[AUDIO] Native mixer enabled")
-
+        # ================= OUTPUT STREAM =================
         self.output = self.audio.open(
             format=pyaudio.paInt16,
             channels=1,
             rate=RATE,
             output=True,
             frames_per_buffer=CHUNK,
-            stream_callback=self._callback,
+            stream_callback=self._callback
         )
         self.output.start_stream()
 
-        threading.Thread(target=self.listen, daemon=True, name="audio-listen").start()
-        for i in range(DECODE_WORKERS):
-            threading.Thread(
-                target=self.decode_worker,
-                args=(i,),
-                daemon=True,
-                name=f"audio-decode-{i}",
-            ).start()
-        threading.Thread(target=self.mixer_loop, daemon=True, name="audio-mixer").start()
+        self.listen_thread = threading.Thread(target=self.listen, daemon=True)
+        self.listen_thread.start()
 
-    def _new_stream_state(self):
-        return StreamState(FRAME, self.dynamic_jitter_target)
+    # --------------------------------------------------
 
     def set_hear_targets(self, targets):
-        with self.state_lock:
-            self.hear_targets = set(targets)
-            for sid in list(self.stream_buffers.keys()):
+        self.hear_targets = set(targets)
+
+        # Flush muted streams immediately
+        with self.stream_lock:
+            for sid in list(self.streams.keys()):
                 if sid not in self.hear_targets:
-                    self.stream_buffers[sid].close()
-                    del self.stream_buffers[sid]
+                    del self.streams[sid]
+                    self.expected_seq.pop(sid, None)
+                    self.playout_ts.pop(sid, None)
+                    self.jitter_target.pop(sid, None)
+                    self.jitter_est.pop(sid, None)
+                    self.last_arrival.pop(sid, None)
+                    self.last_adjust.pop(sid, None)
+                    self.stream_levels.pop(sid, None)
+
+    # --------------------------------------------------
 
     def _callback(self, in_data, frame_count, *_):
-        try:
-            del in_data
-            start = time.perf_counter()
+        frame_bytes = frame_count * 2
+        mixed_pcm = self.mix(frame_bytes)
+        self.last_playout = mixed_pcm
+        return (mixed_pcm, pyaudio.paContinue)
 
-            wanted = frame_count * 2
-            frame = b"\x00" * wanted
-            try:
-                frame = self.output_queue.get_nowait()
-            except queue.Empty:
-                self.stats["callback_underrun"] += 1
-                if len(self.last_played) == wanted:
-                    degraded = bytearray(self.last_played)
-                    samples = memoryview(degraded).cast("h")
-                    for i in range(len(samples)):
-                        samples[i] = int(samples[i] * UNDERRUN_DECAY)
-                    frame = bytes(degraded)
+    # --------------------------------------------------
 
-            if len(frame) != wanted:
-                frame = (frame + (b"\x00" * wanted))[:wanted]
+    def mix(self, frame_bytes):
+        samples = [0] * (frame_bytes // 2)
+        active = 0
 
-            self.last_played = frame
-            if self.webrtc_apm is not None:
-                try:
-                    self.webrtc_apm.process_reverse(frame)
-                except Exception as e:
-                    print(f"[AUDIO] APM reverse error: {e}")
-                    self._apm_error_count += 1
-                    if self._apm_error_count >= 8:
-                        print("[AUDIO] Disabling WebRTC APM after repeated native errors")
-                        self.webrtc_apm = None
+        frames = []
+        with self.stream_lock:
+            for sid in list(self.streams.keys()):
+                if sid not in self.hear_targets:
+                    continue
 
-            self.stats["callback_calls"] += 1
-            self.stats["callback_time_s"] += time.perf_counter() - start
+                buf = self.streams.get(sid)
+                if not buf:
+                    continue
 
-            if self.stats["callback_calls"] % 1000 == 0:
-                avg_ms = (self.stats["callback_time_s"] / self.stats["callback_calls"]) * 1000.0
-                print(
-                    "[AUDIO] callback_avg_ms={:.4f} underrun={} recv={} decode={} mixed={}"
-                    .format(
-                        avg_ms,
-                        self.stats["callback_underrun"],
-                        self.stats["recv_packets"],
-                        self.stats["decode_packets"],
-                        self.stats["mixed_frames"],
-                    )
-                )
+                exp = self.expected_seq.get(sid)
+                if exp is None:
+                    continue
 
-            return (frame, pyaudio.paContinue)
-        except Exception as e:
-            print(f"[AUDIO] Output callback error: {e}")
-            return (b"\x00" * (frame_count * 2), pyaudio.paContinue)
+                # Keep buffer bounded to avoid unbounded delay
+                while len(buf) > MAX_FRAMES:
+                    buf.pop(min(buf.keys()))
 
-    def _input_callback(self, in_data, frame_count, time_info, status):
-        try:
-            del frame_count, time_info, status
-            if in_data is None:
-                return (None, pyaudio.paContinue)
-            try:
-                self.input_queue.put_nowait(in_data)
-            except queue.Full:
-                self.stats["input_queue_drops"] += 1
-                try:
-                    self.input_queue.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self.input_queue.put_nowait(in_data)
-                except queue.Full:
-                    self.stats["input_queue_drops"] += 1
-            return (None, pyaudio.paContinue)
-        except Exception as e:
-            print(f"[AUDIO] Input callback error: {e}")
-            return (None, pyaudio.paContinue)
+                target = self.jitter_target.get(sid, TARGET_FRAMES)
+                if len(buf) < max(MIN_FRAMES, target):
+                    continue
 
-    def _push_decode_item(self, item):
-        try:
-            self.decode_queue.put_nowait(item)
-        except queue.Full:
-            self.stats["recv_drops"] += 1
-            try:
-                self.decode_queue.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                self.decode_queue.put_nowait(item)
-            except queue.Full:
-                self.stats["recv_drops"] += 1
+                if exp in buf:
+                    ts, chunk, _arr = buf.pop(exp)
+                    # Drop late packets
+                    exp_ts = self.playout_ts.get(sid)
+                    if exp_ts is not None and ts < exp_ts:
+                        self.expected_seq[sid] = (exp + 1) & 0xFFFF
+                        continue
+                    frames.append((sid, chunk, ts))
+                else:
+                    self.jitter_stats["missing"] += 1
+                    if self.jitter_stats["missing"] % 100 == 1:
+                        print(f"[JITTER] Missing seq {exp} from {sid}")
+                    frames.append((sid, None, None))
+                self.expected_seq[sid] = (exp + 1) & 0xFFFF
 
-    def _parse_audio_packet(self, data):
-        # New format: sender|seq|timestamp|vad|opus_payload
-        parts = data.split(b"|", 4)
-        if len(parts) == 5:
-            try:
-                sender = parts[0].decode(errors="ignore").strip()
-                seq = int(parts[1]) & 0xFFFF
-                ts = int(parts[2])
-                vad = int(parts[3])
-                opus = parts[4]
-                return sender, seq, ts, vad, opus, False
-            except Exception:
-                pass
+        for sid, chunk, ts in frames:
 
-        # Legacy format fallback: sender:opus_payload
-        if b":" in data:
-            sender, opus = data.split(b":", 1)
-            sender_id = sender.decode(errors="ignore").strip()
-            return sender_id, None, None, 1, opus, True
+            if chunk is None:
+                pcm = self.codec.decode(None)
+                if not pcm:
+                    continue
+                chunk = pcm[:frame_bytes]
+                exp_ts = self.playout_ts.get(sid)
+                if exp_ts is not None:
+                    self.playout_ts[sid] = exp_ts + FRAME
+            else:
+                if ts is not None:
+                    self.playout_ts[sid] = ts + FRAME
 
-        return None, None, None, None, None, None
+            data = struct.unpack("<" + "h" * (frame_bytes // 2), chunk)
+            peak = max(abs(s) for s in data) or 1
+
+            # Per-stream AGC (EMA on peak)
+            prev = self.stream_levels.get(sid, peak)
+            level = 0.9 * prev + 0.1 * peak
+            self.stream_levels[sid] = level
+
+            gain = TARGET_PEAK / level if level > 0 else 1.0
+            gain = max(MIN_GAIN, min(MAX_GAIN, gain))
+
+            data = [int(s * gain) for s in data]
+            samples = [a + b for a, b in zip(samples, data)]
+            active += 1
+
+        if active == 0:
+            return b"\x00" * frame_bytes
+
+        # Soft limiter to prevent clipping without shrinking everything
+        def soft_clip(x):
+            return int(32767 * math.tanh(x / 32767.0))
+
+        output_bytes = struct.pack(
+            "<" + "h" * len(samples),
+            *[soft_clip(s) for s in samples]
+        )
+
+        # Limit logging to avoid spam
+        if not hasattr(self, '_mix_count'):
+            self._mix_count = 0
+        self._mix_count += 1
+        if self._mix_count % 1000 == 0:
+            print(f"[AUDIO] Mixing {active} sources, {self._mix_count} total callbacks")
+
+        return output_bytes
+
+    # --------------------------------------------------
 
     def listen(self):
         print(f"[AUDIO] Listening for audio on port {self.port}")
-        while True:
+        while self.listen_running:
             try:
                 data, addr = self.recv_sock.recvfrom(4096)
             except Exception as e:
-                print(f"[AUDIO] recv_sock error: {e}")
+                if self.listen_running:
+                    print(f"[AUDIO] recv_sock error: {e}")
                 continue
 
-            sender_id, seq, ts, vad, opus, legacy = self._parse_audio_packet(data)
-            del ts
+            self._handle_incoming_packet(data, addr)
 
-            if sender_id is None:
-                print(f"[AUDIO] Malformed packet from {addr}: {data[:50]}")
-                continue
-
-            if self.client_id and sender_id == self.client_id:
-                continue
-
-            self.stats["recv_packets"] += 1
-            self._last_remote_audio_ts = time.monotonic()
-            if legacy:
-                self.stats["recv_legacy"] += 1
-            if vad == 0:
-                self.stats["recv_vad_marked"] += 1
-
-            self._push_decode_item((sender_id, opus, seq))
-
-    def decode_worker(self, worker_id):
-        codec = OpusCodec(
-            rate=RATE,
-            channels=1,
-            frame_size=FRAME,
-            create_encoder=False,
-            create_decoder=True,
-        )
-        while True:
-            try:
-                sender_id, opus, seq = self.decode_queue.get(timeout=1.0)
-            except queue.Empty:
-                continue
-
-            try:
-                pcm = codec.decode(opus)
-            except Exception as e:
-                self.stats["decode_fail"] += 1
-                print(f"[AUDIO] Decode worker {worker_id} error from {sender_id}: {e}")
-                continue
-
-            if not pcm:
-                self.stats["decode_fail"] += 1
-                continue
-
-            with self.state_lock:
-                state = self.stream_buffers.get(sender_id)
-                if state is None:
-                    state = self._new_stream_state()
-                    self.stream_buffers[sender_id] = state
-                state.push(seq, pcm)
-
-            self.stats["decode_packets"] += 1
-
-    def _mix_ready_frames(self):
-        with self.state_lock:
-            targets = tuple(self.hear_targets)
-            frames = []
-            gains = []
-            for sid in targets:
-                state = self.stream_buffers.get(sid)
-                if not state:
-                    continue
-
-                frame = state.pop_for_mix()
-                if frame is None:
-                    self.stats["mixed_miss"] += 1
-                    continue
-
-                frames.append(frame)
-                gains.append(state.gain)
-
-        if not frames:
-            return b"\x00" * FRAME_BYTES, 0
-
-        mixed = native_mix_frames(frames, gains, FRAME)
-        self.stats["native_mix_used"] += 1
-        return mixed, len(frames)
-
-    def _push_output_frame(self, frame):
-        try:
-            self.output_queue.put_nowait(frame)
-        except queue.Full:
-            try:
-                self.output_queue.get_nowait()
-            except queue.Empty:
-                return
-            try:
-                self.output_queue.put_nowait(frame)
-            except queue.Full:
-                return
-
-    def mixer_loop(self):
-        frame_interval = FRAME / float(RATE)
-        next_deadline = time.perf_counter()
-
-        while True:
-            # Keep playout buffer shallow to reduce end-to-end delay and help AEC alignment.
-            if self.output_queue.qsize() >= OUTPUT_QUEUE_TARGET:
-                time.sleep(frame_interval * 0.5)
-                next_deadline = time.perf_counter()
-                continue
-
-            frame, active = self._mix_ready_frames()
-            self._push_output_frame(frame)
-
-            self.stats["mixed_frames"] += 1
-            self.stats["mixed_sources"] += active
-            self._adapt_jitter_target()
-
-            if self.stats["mixed_frames"] % 1000 == 0:
-                avg_sources = self.stats["mixed_sources"] / max(1, self.stats["mixed_frames"])
-                print(
-                    "[AUDIO] mixed_frames={} avg_sources={:.2f} mixed_miss={} decode_queue={} output_queue={} native={} python={}"
-                    .format(
-                        self.stats["mixed_frames"],
-                        avg_sources,
-                        self.stats["mixed_miss"],
-                        self.decode_queue.qsize(),
-                        self.output_queue.qsize(),
-                        self.stats["native_mix_used"],
-                        self.stats["python_mix_used"],
-                    )
-                )
-
-            next_deadline += frame_interval
-            sleep_time = next_deadline - time.perf_counter()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-            else:
-                next_deadline = time.perf_counter()
-
-    def _compute_vad(self, pcm_bytes):
-        samples = memoryview(pcm_bytes).cast("h")
-        if not samples:
-            self.last_vad_rms = 0.0
-            if self.vad_hangover > 0:
-                self.vad_hangover -= 1
-                self.last_vad_flag = 1
-                return 1
-            self.last_vad_flag = 0
-            return 0
-
-        energy = 0
-        for s in samples:
-            energy += s * s
-        rms = (energy / len(samples)) ** 0.5
-
-        if rms > VAD_THRESHOLD:
-            self.vad_hangover = VAD_HANGOVER_FRAMES
-            vad = 1
-        elif self.vad_hangover > 0:
-            self.vad_hangover -= 1
-            vad = 1
-        else:
-            vad = 0
-
-        self.last_vad_rms = rms
-        self.last_vad_flag = vad
-        return vad
-
-    @staticmethod
-    def _clamp_i16(v):
-        if v > 32767:
-            return 32767
-        if v < -32768:
-            return -32768
-        return v
-
-    @staticmethod
-    def _rms_from_samples(samples):
-        if not samples:
-            return 0.0
-        energy = 0
-        for s in samples:
-            energy += s * s
-        return (energy / len(samples)) ** 0.5
-
-    def _update_noise_floor(self, rms):
-        # Track a stable background floor; react slower upward than downward.
-        alpha_up = 0.005
-        alpha_down = 0.02
-        if rms > self._noise_floor_ema:
-            self._noise_floor_ema += (rms - self._noise_floor_ema) * alpha_up
-        else:
-            self._noise_floor_ema += (rms - self._noise_floor_ema) * alpha_down
-
-    def _preprocess_capture(self, pcm_bytes):
-        if self.webrtc_apm is not None:
-            try:
-                pcm_bytes = self.webrtc_apm.process_capture(pcm_bytes)
-                self._apm_error_count = 0
-            except Exception as e:
-                print(f"[AUDIO] APM capture error: {e}")
-                # Native APM faults can become persistent once internal state is corrupted.
-                # Disable immediately to keep call audio alive.
-                self._apm_error_count += 1
-                print("[AUDIO] Disabling WebRTC APM after native capture error")
-                try:
-                    self.webrtc_apm.close()
-                except Exception:
-                    pass
-                self.webrtc_apm = None
-
-        # Conservative processing for lower disturbance without heavy dependencies:
-        # 1) suppress speaker leakage using current playback frame
-        # 2) remove DC/low rumble with a one-pole DC blocker
-        # 3) simple noise gate on very low-level background noise
-        mic_out = bytearray(pcm_bytes)
-        mic = memoryview(mic_out).cast("h")
-
-        # Fallback suppression path for cases where AEC is running but not converging.
-        fallback_active = False
-        if (
-            ENABLE_AEC_FALLBACK_SUPPRESS
-            and self._aec_unhealthy
-            and len(self.last_played) == len(pcm_bytes)
-        ):
-            remote_recent = (time.monotonic() - self._last_remote_audio_ts) <= AEC_FALLBACK_REMOTE_ACTIVE_SEC
-            ref = memoryview(self.last_played).cast("h")
-            ref_rms = self._rms_from_samples(ref)
-            mic_rms = self._rms_from_samples(mic)
-            if remote_recent and ref_rms >= AEC_FALLBACK_MIN_REF_RMS and ref_rms > (mic_rms * 0.75):
-                fallback_active = True
-                for i in range(FRAME):
-                    estimate = int(ref[i] * AEC_FALLBACK_SUBTRACT_ALPHA)
-                    residual = mic[i] - estimate
-                    mic[i] = self._clamp_i16(int(residual * AEC_FALLBACK_RESIDUAL_GAIN))
-        self._fallback_active = fallback_active
-
-        if ENABLE_ECHO_SUPPRESS and len(self.last_played) == len(pcm_bytes):
-            ref = memoryview(self.last_played).cast("h")
-            ref_rms = self._rms_from_samples(ref)
-            mic_rms = self._rms_from_samples(mic)
-            if ref_rms >= ECHO_SUPPRESS_MIN_RMS and ref_rms > (mic_rms * 0.8):
-                for i in range(FRAME):
-                    mic[i] = self._clamp_i16(int(mic[i] * ECHO_ATTENUATE_GAIN))
-
-        prev_x = self._dc_prev_x
-        prev_y = self._dc_prev_y
-        for i in range(FRAME):
-            x = float(mic[i])
-            y = x - prev_x + (DC_BLOCK_R * prev_y)
-            prev_x = x
-            prev_y = y
-            mic[i] = self._clamp_i16(int(y))
-        self._dc_prev_x = prev_x
-        self._dc_prev_y = prev_y
-
-        if ENABLE_LOWPASS_SMOOTH:
-            # One-pole low-pass smoothing to suppress high-frequency hiss.
-            prev = self._lp_prev
-            for i in range(FRAME):
-                cur = float(mic[i])
-                smoothed = (0.6 * prev) + (0.4 * cur)
-                mic[i] = self._clamp_i16(int(smoothed))
-                prev = smoothed
-            self._lp_prev = prev
-
-        rms = self._rms_from_samples(mic)
-        self._update_noise_floor(rms)
-        dynamic_floor = max(NOISE_GATE_RMS, self._noise_floor_ema * 1.8)
-
-        # Soft gate envelope avoids hard on/off chopping and click noise.
-        open_thr = max(NOISE_GATE_ATTACK_RMS, dynamic_floor * 1.35)
-        close_thr = dynamic_floor
-        if rms >= open_thr:
-            desired_gain = 1.0
-        elif rms <= close_thr:
-            desired_gain = GATE_MIN_GAIN
-        else:
-            ratio = (rms - close_thr) / max(1.0, open_thr - close_thr)
-            desired_gain = GATE_MIN_GAIN + ((1.0 - GATE_MIN_GAIN) * ratio)
-
-        if desired_gain > self._gate_gain:
-            self._gate_gain += (desired_gain - self._gate_gain) * GATE_ATTACK
-        else:
-            self._gate_gain += (desired_gain - self._gate_gain) * GATE_RELEASE
-
-        if self._gate_gain < 0.999 and (self.webrtc_apm is None or APPLY_SOFT_GATE_WITH_APM):
-            for i in range(FRAME):
-                mic[i] = self._clamp_i16(int(mic[i] * self._gate_gain))
-
-        return bytes(mic_out)
-
-    def _adapt_jitter_target(self):
-        mixed_now = self.stats["mixed_frames"]
-        window = mixed_now - self._adapt_prev_mixed
-        if window < 200:
+    def _handle_incoming_packet(self, data, addr):
+        if b":" not in data:
+            print(f"[AUDIO] Malformed packet from {addr}: {data[:50]}")
             return
 
-        miss_now = self.stats["mixed_miss"]
-        cb_now = self.stats["callback_calls"]
-        underrun_now = self.stats["callback_underrun"]
+        header, opus = data.split(b":", 1)
+        header = header.decode(errors="ignore")
+        if "|" not in header:
+            return
+        sender_id, seq_s, ts_s = header.split("|", 2)
+        try:
+            seq = int(seq_s) & 0xFFFF
+            ts = int(ts_s)
+        except ValueError:
+            return
+        sender_id = sender_id.strip()
 
-        miss_delta = miss_now - self._adapt_prev_miss
-        cb_delta = cb_now - self._adapt_prev_callback
-        underrun_delta = underrun_now - self._adapt_prev_underrun
-        underrun_rate = underrun_delta / max(1, cb_delta)
+        if sender_id == self.client_id:
+            return
 
-        new_target = self.dynamic_jitter_target
-        if underrun_rate > 0.05 or miss_delta > int(window * 0.60):
-            new_target = min(JITTER_TARGET_MAX, new_target + 1)
-        elif underrun_rate < 0.01 and miss_delta < int(window * 0.15):
-            new_target = max(JITTER_TARGET_MIN, new_target - 1)
+        if not hasattr(self, "_packet_count"):
+            self._packet_count = {}
 
-        if new_target != self.dynamic_jitter_target:
-            self.dynamic_jitter_target = new_target
-            with self.state_lock:
-                for state in self.stream_buffers.values():
-                    state.jitter_buffer.target_fill = new_target
-            print(f"[AUDIO] Adaptive jitter target -> {new_target}")
+        if sender_id not in self._packet_count:
+            self._packet_count[sender_id] = 0
+            print(f"[AUDIO] First packet from sender: {sender_id}")
 
-        self._adapt_prev_mixed = mixed_now
-        self._adapt_prev_miss = miss_now
-        self._adapt_prev_callback = cb_now
-        self._adapt_prev_underrun = underrun_now
+        self._packet_count[sender_id] += 1
+        self.jitter_stats["received"] += 1
+
+        if self._packet_count[sender_id] % 20 == 1:
+            print(f"[AUDIO] Received #{self._packet_count[sender_id]} from {sender_id} (size: {len(opus)} bytes)")
+
+        # Always decode & buffer
+        try:
+            pcm = self.codec.decode(opus)
+            if pcm:
+                frame_bytes = CHUNK * 2
+                arrival_time = time.time()
+                with self.stream_lock:
+                    buf = self.streams.setdefault(sender_id, {})
+                    exp_ts = self.playout_ts.get(sender_id)
+                    if exp_ts is not None and ts < exp_ts:
+                        return
+                    buf[seq] = (ts, pcm[:frame_bytes], arrival_time)
+                    if sender_id not in self.expected_seq:
+                        self.expected_seq[sender_id] = seq
+                    if sender_id not in self.playout_ts:
+                        self.playout_ts[sender_id] = ts
+                    if sender_id not in self.jitter_target:
+                        self.jitter_target[sender_id] = TARGET_FRAMES
+
+                    # Jitter estimate (arrival delta vs expected frame time)
+                    if sender_id in self.last_arrival:
+                        delta = arrival_time - self.last_arrival[sender_id]
+                        expected = FRAME / RATE
+                        jitter = abs(delta - expected)
+                        prev = self.jitter_est.get(sender_id, jitter)
+                        self.jitter_est[sender_id] = 0.9 * prev + 0.1 * jitter
+                    self.last_arrival[sender_id] = arrival_time
+
+                    # Adapt jitter target ~1x per second
+                    last_adj = self.last_adjust.get(sender_id, 0)
+                    if arrival_time - last_adj > 1.0:
+                        j = self.jitter_est.get(sender_id, 0)
+                        tgt = self.jitter_target.get(sender_id, TARGET_FRAMES)
+                        if j > 0.020:
+                            tgt = min(MAX_FRAMES, tgt + 1)
+                        elif j < 0.005:
+                            tgt = max(MIN_FRAMES, tgt - 1)
+                        self.jitter_target[sender_id] = tgt
+                        self.last_adjust[sender_id] = arrival_time
+                        if int(arrival_time) % 5 == 0:
+                            print(f"[JITTER] {sender_id}: target={tgt} jitter={j*1000:.1f}ms")
+
+                    # Prevent unbounded growth (drop oldest)
+                    while len(buf) > MAX_FRAMES:
+                        buf.pop(min(buf.keys()))
+            else:
+                print(f"[AUDIO] Failed to decode Opus from {sender_id}")
+        except Exception as e:
+            print(f"[AUDIO] Decode error from {sender_id}: {e}")
+
+    def listen_multicast(self):
+        while self.listen_running and self.multicast_running:
+            try:
+                data, addr = self.multicast_sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.listen_running and self.multicast_running:
+                    print(f"[AUDIO] multicast recv error: {e}")
+                break
+            self._handle_incoming_packet(data, addr)
+
+    def join_multicast(self, multicast_addr):
+        if not multicast_addr:
+            return
+        if self.multicast_group == multicast_addr and self.multicast_sock is not None:
+            return
+
+        self.leave_multicast()
+        try:
+            msock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+            msock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                msock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass
+            msock.bind(("", AUDIO_PORT))
+            mreq = struct.pack("4s4s", socket.inet_aton(multicast_addr), socket.inet_aton("0.0.0.0"))
+            msock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+            msock.settimeout(1.0)
+
+            self.multicast_sock = msock
+            self.multicast_group = multicast_addr
+            self.multicast_running = True
+            self.multicast_thread = threading.Thread(target=self.listen_multicast, daemon=True)
+            self.multicast_thread.start()
+            print(f"[AUDIO] Joined multicast group {multicast_addr}:{AUDIO_PORT}")
+        except Exception as e:
+            print(f"[AUDIO] Failed to join multicast {multicast_addr}:{AUDIO_PORT}: {e}")
+            try:
+                msock.close()
+            except Exception:
+                pass
+            self.multicast_sock = None
+            self.multicast_group = None
+            self.multicast_running = False
+
+    def leave_multicast(self):
+        self.multicast_running = False
+        if self.multicast_sock is not None and self.multicast_group:
+            try:
+                mreq = struct.pack("4s4s", socket.inet_aton(self.multicast_group), socket.inet_aton("0.0.0.0"))
+                self.multicast_sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP, mreq)
+            except Exception:
+                pass
+        try:
+            if self.multicast_sock is not None:
+                self.multicast_sock.close()
+        except Exception:
+            pass
+        self.multicast_sock = None
+        self.multicast_group = None
+
+    # --------------------------------------------------
 
     def start(self, server_ip):
-        with self.start_stop_lock:
-            if self.running or not self.client_id:
-                return
+        if self.running or not self.client_id:
+            return
 
-            while not self.input_queue.empty():
-                try:
-                    self.input_queue.get_nowait()
-                except queue.Empty:
-                    break
+        self.running = True
+        print(f"[AUDIO] Audio capture ACTIVE for {self.client_id} -> {server_ip}:50002")
 
-            self._send_generation += 1
-            generation = self._send_generation
-            self.running = True
-            print(f"[AUDIO] Audio capture ACTIVE for {self.client_id} -> {server_ip}:50002")
+        self.input = self.audio.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK
+        )
 
-            self.input = self.audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=RATE,
-                input=True,
-                frames_per_buffer=CHUNK,
-                stream_callback=self._input_callback,
-            )
-            self.input.start_stream()
+        self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
 
-            self.tx_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.tx_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-            self._tx_sock = self.tx_sock
-
-        def send(thread_generation):
+        def send():
             packet_count = 0
-            next_status_log = time.monotonic() + 2.0
-            while True:
-                with self.start_stop_lock:
-                    if not self.running or self._send_generation != thread_generation:
-                        break
-                    input_stream = self.input
-                    sock = self._tx_sock
-                if input_stream is None:
-                    time.sleep(0.01)
-                    continue
-
+            while self.running:
                 try:
-                    try:
-                        pcm = self.input_queue.get(timeout=0.2)
-                    except queue.Empty:
-                        continue
+                    pcm = self.input.read(CHUNK, exception_on_overflow=False)
 
-                    if len(pcm) != FRAME_BYTES:
-                        pcm = (pcm + (b"\x00" * FRAME_BYTES))[:FRAME_BYTES]
-
-                    pcm = self._preprocess_capture(pcm)
-
-                    if hasattr(self, "aec") and self.aec and hasattr(self, "last_played"):
+                    # 1) AEC
+                    if ENABLE_AEC and self.aec:
                         try:
-                            pcm = self.aec.process(pcm, self.last_played)
+                            pcm = self.aec.process(pcm, self.last_playout)
+                        except Exception:
+                            self.aec = None
+
+                    # 2) Noise suppression + VAD
+                    is_speech = True
+                    if ENABLE_NS and self.denoiser:
+                        try:
+                            half = len(pcm) // 2
+                            h1, h2 = pcm[:half], pcm[half:]
+                            prob1, d1 = self.denoiser.denoise_frame(h1)
+                            prob2, d2 = self.denoiser.denoise_frame(h2)
+                            pcm = d1 + d2
+                            is_speech = (prob1 + prob2) / 2 > VAD_THRESHOLD
                         except Exception:
                             pass
 
-                    opus = self.tx_codec.encode(pcm)
-                    if not opus:
-                        continue
-
-                    seq = self.tx_seq
-                    ts = self.tx_ts
-                    vad = self._compute_vad(pcm)
-                    if vad:
-                        self.stats["tx_vad_voice"] += 1
-                    else:
-                        self.stats["tx_vad_silence"] += 1
-
-                    header = f"{self.client_id}|{seq}|{ts}|{vad}|".encode()
-                    packet = header + opus
-
-                    if sock is None:
-                        continue
-
-                    try:
-                        sock.sendto(packet, (server_ip, 50002))
-                    except OSError as e:
-                        if not self.running:
-                            break
-                        print(f"[AUDIO] Send error: {e}")
-                        continue
-
-                    self.tx_seq = (self.tx_seq + 1) & 0xFFFF
-                    self.tx_ts = (self.tx_ts + FRAME) & 0xFFFFFFFF
-
-                    packet_count += 1
-                    self.stats["tx_packets"] += 1
-                    if packet_count % 100 == 0:
-                        print(f"[AUDIO] Sent {packet_count} packets from {self.client_id}")
-
-                    now = time.monotonic()
-                    if now >= next_status_log:
-                        apm_info = ""
-                        if self.webrtc_apm is not None and now >= self._next_apm_metrics_log:
-                            try:
-                                m = self.webrtc_apm.get_metrics()
-                                if m is not None:
-                                    prev_unhealthy = self._aec_unhealthy
-                                    remote_recent = (
-                                        time.monotonic() - self._last_remote_audio_ts
-                                    ) <= AEC_FALLBACK_REMOTE_ACTIVE_SEC
-                                    if remote_recent and m["erle_db"] < AEC_FALLBACK_ERLE_THRESHOLD_DB:
-                                        self._aec_unhealthy_windows += 1
-                                    else:
-                                        self._aec_unhealthy_windows = 0
-                                    self._aec_unhealthy = (
-                                        self._aec_unhealthy_windows >= AEC_FALLBACK_TRIGGER_WINDOWS
-                                    )
-                                    if self._aec_unhealthy != prev_unhealthy:
-                                        state = "ON" if self._aec_unhealthy else "OFF"
-                                        print(
-                                            "[AUDIO] AEC fallback {} (erle={:.1f}dB, erl={:.1f}dB, dly={}ms)"
-                                            .format(
-                                                state,
-                                                m["erle_db"],
-                                                m["erl_db"],
-                                                m["delay_ms"],
-                                            )
-                                        )
-                                    apm_info = " aec(erl={:.1f}dB erle={:.1f}dB dly={}ms)".format(
-                                        m["erl_db"],
-                                        m["erle_db"],
-                                        m["delay_ms"],
-                                    )
-                            except Exception as e:
-                                apm_info = f" aec(err={e})"
-                            self._next_apm_metrics_log = now + 5.0
-
-                        print(
-                            "[AUDIO] TX status active={} rms={:.1f} vad={} voice={} silence={} sent={}{}"
-                            .format(
-                                self.running,
-                                self.last_vad_rms,
-                                self.last_vad_flag,
-                                self.stats["tx_vad_voice"],
-                                self.stats["tx_vad_silence"],
-                                self.stats["tx_packets"],
-                                apm_info + f" fallback={'active' if self._fallback_active else ('armed' if self._aec_unhealthy else 'off')}",
-                            )
-                        )
-                        next_status_log = now + 2.0
+                    # 3) Encode and send
+                    if is_speech:
+                        opus = self.codec.encode(pcm)
+                        if opus:
+                            header = f"{self.client_id}|{self.seq}|{self.timestamp}".encode()
+                            packet = header + b":" + opus
+                            self.seq = (self.seq + 1) & 0xFFFF
+                            self.timestamp += FRAME
+                            self.send_sock.sendto(packet, (server_ip, 50002))
+                            packet_count += 1
+                            if packet_count % 100 == 0:
+                                print(f"[AUDIO] Sent {packet_count} packets from {self.client_id}")
                 except Exception as e:
                     print(f"[AUDIO] Send error: {e}")
-                    with self.start_stop_lock:
-                        if not self.running or self._send_generation != thread_generation:
-                            break
 
-            print(f"[AUDIO] Send thread stopped for {self.client_id} (gen={thread_generation})")
-
-        self.send_thread = threading.Thread(target=send, args=(generation,), daemon=True, name="audio-send")
+        self.send_thread = threading.Thread(target=send, daemon=True)
         self.send_thread.start()
 
+    # --------------------------------------------------
+
     def stop(self):
-        input_stream = None
-        tx_sock = None
-        thread = None
+        # Stop capture only (keep receive/output alive)
+        self.running = False
 
-        with self.start_stop_lock:
-            self._send_generation += 1
-            self.running = False
-            input_stream = self.input
-            self.input = None
-            tx_sock = self.tx_sock
-            self.tx_sock = None
-            self._tx_sock = None
-            thread = self.send_thread
-            self.send_thread = None
+        try:
+            if hasattr(self, "input"):
+                self.input.stop_stream()
+                self.input.close()
+        except Exception:
+            pass
 
-        if input_stream is not None:
-            try:
-                input_stream.stop_stream()
-                input_stream.close()
-            except Exception as e:
-                print(f"[AUDIO] Input close error: {e}")
+        try:
+            if hasattr(self, "send_sock"):
+                self.send_sock.close()
+        except Exception:
+            pass
 
-        if tx_sock is not None:
-            try:
-                tx_sock.close()
-            except Exception as e:
-                print(f"[AUDIO] Socket close error: {e}")
+    def shutdown(self):
+        # Full shutdown (called on app exit)
+        self.running = False
+        self.listen_running = False
+        self.leave_multicast()
 
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                print(f"[AUDIO] Warning: send thread still alive for {self.client_id}")
+        try:
+            self.recv_sock.close()
+        except Exception:
+            pass
+
+        try:
+            self.output.stop_stream()
+            self.output.close()
+        except Exception:
+            pass
+
+        try:
+            self.audio.terminate()
+        except Exception:
+            pass
+

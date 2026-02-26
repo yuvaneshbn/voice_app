@@ -34,8 +34,9 @@ void AudioMixer::mix(int16_t* output, int activeStreams) {
     }
 
     const float norm = (activeStreams > 1) ? (1.0f / static_cast<float>(activeStreams)) : 1.0f;
+    const float base_gain = 1.0f;
     for (int i = 0; i < frameSize; ++i) {
-        const int32_t v = static_cast<int32_t>(accumulator[i] * norm);
+        const int32_t v = static_cast<int32_t>(accumulator[i] * norm * base_gain);
         output[i] = clamp32(v);
     }
 }

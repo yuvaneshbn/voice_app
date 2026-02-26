@@ -1,6 +1,7 @@
 #include "mixer.h"
 #include "ringbuffer.h"
 #include "webrtc_apm.h"
+#include "agc.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -146,6 +147,38 @@ EXPORT_API int apm_get_metrics(void* handle, float* erl, float* erle, int* delay
         return apm->getMetrics(erl, erle, delayMs);
     } catch (...) {
         return 0;
+    }
+}
+
+EXPORT_API void* agc_create(float targetRMS) {
+    try {
+        return new SimpleAGC(targetRMS);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+EXPORT_API void agc_destroy(void* handle) {
+    try {
+        if (!handle) {
+            return;
+        }
+        auto* agc = static_cast<SimpleAGC*>(handle);
+        delete agc;
+    } catch (...) {
+        return;
+    }
+}
+
+EXPORT_API float agc_process(void* handle, const int16_t* samples, int frameSize) {
+    try {
+        if (!handle || !samples || frameSize <= 0) {
+            return 1.0f;
+        }
+        auto* agc = static_cast<SimpleAGC*>(handle);
+        return agc->process(samples, frameSize);
+    } catch (...) {
+        return 1.0f;
     }
 }
 }

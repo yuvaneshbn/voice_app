@@ -1,4 +1,5 @@
 import faulthandler
+import os
 import socket
 import sys
 import time
@@ -6,6 +7,7 @@ import threading
 import traceback
 
 from PySide6.QtWidgets import QApplication, QDialog, QMainWindow
+from PySide6.QtCore import QTimer
 
 from audio import AudioEngine
 from network import Network
@@ -17,6 +19,7 @@ INACTIVE = "QPushButton { background:#dddddd; }"
 SELF = "QPushButton { background:#3498db; color:white; }"
 CONTROL_PORT = 50001
 DEFAULT_ROOM = "main"
+REGISTER_SECRET = os.getenv("VOICE_REGISTER_SECRET", "mysecret")
 
 
 def send_control_command(server_ip, command, timeout=5.0):
@@ -85,6 +88,12 @@ class MainWindow(QMainWindow):
         self.ui.statusbar.showMessage(f"You are Client {self.my_id} - Connected")
 
         self.audio.set_hear_targets(self.hear_targets)
+        self._hb_stop = threading.Event()
+        threading.Thread(target=self.heartbeat_loop, daemon=True, name="heartbeat").start()
+        self._stop_capture_timer = QTimer(self)
+        self._stop_capture_timer.setSingleShot(True)
+        self._stop_capture_timer.setInterval(1200)
+        self._stop_capture_timer.timeout.connect(self._stop_capture_if_idle)
 
     def disable_all_controls(self):
         for btn in self.talk_buttons.values():
@@ -135,15 +144,30 @@ class MainWindow(QMainWindow):
         if not self.registration_successful:
             return
 
-        # Keep capture thread stable once started; stopping/restarting rapidly on UI
-        # target changes caused send-thread generation churn in practice.
         if self.targets and not self.audio.running:
+            if self._stop_capture_timer.isActive():
+                self._stop_capture_timer.stop()
             self.audio.start(self.server_ip)
+        elif not self.targets and self.audio.running and not self._stop_capture_timer.isActive():
+            # Debounce stop to avoid capture churn when users quickly toggle targets.
+            self._stop_capture_timer.start()
 
         targets = ",".join(sorted(self.targets))
         ok, response = send_control_command(self.server_ip, f"TARGETS:{self.my_id}:{targets}")
         if not ok or response != "OK":
             print(f"[CLIENT] Failed to update targets: {response}")
+            self.ui.statusbar.showMessage(f"You are Client {self.my_id} - Connection issue")
+
+    def _stop_capture_if_idle(self):
+        if not self.targets and self.audio.running:
+            self.audio.stop()
+
+    def heartbeat_loop(self):
+        while not self._hb_stop.is_set():
+            ok, response = send_control_command(self.server_ip, f"PING:{self.my_id}", timeout=3.0)
+            if not ok or response != "OK":
+                print(f"[CLIENT] Heartbeat failed: {response}")
+            self._hb_stop.wait(10.0)
 
     def broadcast(self):
         if not self.registration_successful:
@@ -166,6 +190,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         try:
+            self._hb_stop.set()
+            if self._stop_capture_timer.isActive():
+                self._stop_capture_timer.stop()
             send_control_command(self.server_ip, f"UNREGISTER:{self.my_id}")
             print(f"[CLIENT] Sent unregistration: {self.my_id}")
         except Exception as e:
@@ -177,29 +204,36 @@ class MainWindow(QMainWindow):
 
 def register_client_with_server(client_id, server_ip, audio_port):
     try:
-        ok, response = send_control_command(server_ip, f"REGISTER:{client_id}:{audio_port}")
+        ok, response = send_control_command(
+            server_ip,
+            f"REGISTER:{client_id}:{audio_port}:{REGISTER_SECRET}",
+        )
         if not ok:
             print(f"[CLIENT] Registration error: {response}")
-            return False
+            return False, None
 
         if response == "TAKEN":
             print(f"[CLIENT] Client ID {client_id} already taken")
-            return False
+            return False, None
 
         if response != "OK":
             print(f"[CLIENT] Unexpected registration response: {response}")
-            return False
+            return False, None
 
         join_ok, join_response = send_control_command(server_ip, f"JOIN:{client_id}:{DEFAULT_ROOM}")
-        if not join_ok or join_response != "OK":
+        if not join_ok or not join_response.startswith("OK"):
             print(f"[CLIENT] JOIN failed for client {client_id}: {join_response}")
-            return False
+            return False, None
+
+        multicast_addr = None
+        if ":" in join_response:
+            _, multicast_addr = join_response.split(":", 1)
 
         print(f"[CLIENT] Registration successful for client {client_id}")
-        return True
+        return True, multicast_addr
     except Exception as e:
         print(f"[CLIENT] Registration error: {e}")
-        return False
+        return False, None
 
 
 def main():
@@ -269,7 +303,8 @@ def main():
     print(f"[CLIENT] Audio engine initialized on port {audio_port}")
 
     print("[CLIENT] Registering with server...")
-    if not register_client_with_server(client_id, net.server_ip, audio_port):
+    registered, multicast_addr = register_client_with_server(client_id, net.server_ip, audio_port)
+    if not registered:
         from PySide6.QtWidgets import QMessageBox
 
         msg = QMessageBox()
@@ -280,6 +315,8 @@ def main():
         msg.exec()
         audio.stop()
         sys.exit(1)
+    if multicast_addr:
+        audio.join_multicast(multicast_addr.strip())
 
     print("[CLIENT] Registration successful - starting UI...")
 
