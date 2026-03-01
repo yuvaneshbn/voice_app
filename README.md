@@ -25,10 +25,11 @@ The project provides a desktop client (PySide6), a lightweight forwarding server
 13. Build Windows QoS Installer EXE
 14. Build Client EXE (PyInstaller)
 15. Build Server EXE (PyInstaller)
-16. Validation Checklist
-17. Troubleshooting
-18. Development Notes
-19. License
+16. Full EXE Build Process (Step-by-Step)
+17. Validation Checklist
+18. Troubleshooting
+19. Development Notes
+20. License
 
 ## 1. Overview
 
@@ -391,7 +392,82 @@ pyinstaller --noconfirm --clean server.spec
 
 This spec bundles Opus for frozen builds (`..\opus\opus.dll -> opus\opus.dll`), so `server.exe` can start without requiring a separate local DLL copy.
 
-## 16. Validation Checklist
+## 16. Full EXE Build Process (Step-by-Step)
+
+Use this when you want to generate all EXEs from scratch.
+
+From repository root:
+
+```powershell
+cd C:\Users\YUVANESH\Desktop\projects\Two-way-switch1
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+pip install pyinstaller
+```
+
+Build native audio DLL (required for client EXE):
+
+```powershell
+.\audio_native\build_native.ps1
+```
+
+Build QoS installer EXE:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/build_qos_installer.ps1
+```
+
+Build client EXE:
+
+```powershell
+cd client
+pyinstaller --noconfirm --clean --onefile --windowed `
+  --name VoiceClient `
+  --icon "technical-support.ico" `
+  --hidden-import PySide6.QtUiTools `
+  --add-data "ui;ui" `
+  --add-data "technical-support.ico;." `
+  --add-binary "opus.dll;opus" `
+  --add-binary "native_mixer.dll;audio_native" `
+  main.py
+```
+
+Build server EXE:
+
+```powershell
+cd ..\server
+Get-Process server -ErrorAction SilentlyContinue | Stop-Process -Force
+pyinstaller --noconfirm --clean server.spec
+```
+
+Output files:
+
+- `dist/VoiceQoSSetup.exe`
+- `client/dist/VoiceClient.exe`
+- `server/dist/server.exe`
+
+Port verification for server (important):
+
+```powershell
+netstat -aon | findstr :50001
+netstat -aon | findstr :50002
+```
+
+If port is busy, note PID from the last column and stop it:
+
+```powershell
+taskkill /PID <PID> /F
+```
+
+Then run the server EXE:
+
+```powershell
+cd ..\server\dist
+.\server.exe
+```
+
+## 17. Validation Checklist
 
 1. Start server and two clients.
 2. Verify both clients appear automatically in participant list.
@@ -401,7 +477,7 @@ This spec bundles Opus for frozen builds (`..\opus\opus.dll -> opus\opus.dll`), 
 6. Verify leave room unregisters and exits.
 7. Verify QoS policies and DSCP values (optional, Wireshark).
 
-## 17. Troubleshooting
+## 18. Troubleshooting
 
 ### Startup dialog appears but main window does not open in EXE
 
@@ -423,6 +499,16 @@ This spec bundles Opus for frozen builds (`..\opus\opus.dll -> opus\opus.dll`), 
 
 - Cause: EXE was built without bundling Opus runtime DLL.
 - Fix: build from `server` folder using:
+  - `pyinstaller --noconfirm --clean server.spec`
+
+### PyInstaller build fails with `PermissionError: [WinError 5] Access is denied: ...\dist\server.exe`
+
+- Cause: `server.exe` is already running, so PyInstaller cannot overwrite it.
+- Check who is using port 50001:
+  - `netstat -aon | findstr :50001`
+- Stop the process by PID:
+  - `taskkill /PID <PID> /F`
+- Rebuild:
   - `pyinstaller --noconfirm --clean server.spec`
 
 ### Discovery fails
@@ -448,7 +534,7 @@ This spec bundles Opus for frozen builds (`..\opus\opus.dll -> opus\opus.dll`), 
   - `--icon "technical-support.ico"`
   - `--add-data "technical-support.ico;."`
 
-## 18. Development Notes
+## 19. Development Notes
 
 - Control plane is TCP for reliability.
 - Media plane is UDP for latency.
@@ -457,6 +543,6 @@ This spec bundles Opus for frozen builds (`..\opus\opus.dll -> opus\opus.dll`), 
 
 When changing protocol or packet format, update both client and server parsing and writer logic.
 
-## 19. License
+## 20. License
 
 MIT License. See `LICENSE`.
