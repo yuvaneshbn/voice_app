@@ -114,7 +114,9 @@ class VolumeControlPanel:
         self.gain_slider = self.widget.findChild(QSlider, "gainSlider")
         self.output_slider = self.widget.findChild(QSlider, "outputSlider")
         self.mic_sensitivity_slider = self.widget.findChild(QSlider, "micSensitivitySlider")
+        self.noise_suppression_label = self.widget.findChild(QLabel, "noiseSuppressionLabel")
         self.noise_suppression_slider = self.widget.findChild(QSlider, "noiseSuppressionSlider")
+        self.noise_suppression_enable_checkbox = self.widget.findChild(QCheckBox, "noiseSuppressionEnableCheckbox")
         self.auto_gain_checkbox = self.widget.findChild(QCheckBox, "autoGainCheckbox")
         self.echo_checkbox = self.widget.findChild(QCheckBox, "echoCheckbox")
         self.test_mic_button = self.widget.findChild(QPushButton, "testMicButton")
@@ -142,6 +144,10 @@ class VolumeControlPanel:
         if self.auto_gain_checkbox is not None:
             self.auto_gain_checkbox.setChecked(self.audio.auto_gain)
 
+        if self.noise_suppression_enable_checkbox is not None:
+            self.noise_suppression_enable_checkbox.setChecked(self.audio.noise_suppression_enabled)
+        self._sync_noise_suppression_controls()
+
         if self.echo_checkbox is not None:
             self.echo_checkbox.setChecked(self.audio.echo_enabled)
             self.echo_checkbox.setEnabled(self.audio.echo is not None)
@@ -166,6 +172,8 @@ class VolumeControlPanel:
 
         if self.noise_suppression_slider is not None:
             self.noise_suppression_slider.valueChanged.connect(self.audio.set_noise_suppression)
+        if self.noise_suppression_enable_checkbox is not None:
+            self.noise_suppression_enable_checkbox.toggled.connect(self._on_noise_suppression_toggled)
 
         if self.auto_gain_checkbox is not None:
             self.auto_gain_checkbox.toggled.connect(self.audio.set_auto_gain)
@@ -185,6 +193,17 @@ class VolumeControlPanel:
     def set_mic_level(self, level):
         if self.mic_level_bar is not None:
             self.mic_level_bar.setValue(max(0, min(100, int(level))))
+
+    def _sync_noise_suppression_controls(self):
+        enabled = bool(self.audio.noise_suppression_enabled)
+        if self.noise_suppression_slider is not None:
+            self.noise_suppression_slider.setEnabled(enabled)
+        if self.noise_suppression_label is not None:
+            self.noise_suppression_label.setEnabled(enabled)
+
+    def _on_noise_suppression_toggled(self, checked):
+        self.audio.set_noise_suppression_enabled(checked)
+        self._sync_noise_suppression_controls()
 
 
 class ParticipantRow:
@@ -518,7 +537,6 @@ class MainWindow(QMainWindow):
     def _recompute_hear_targets(self):
         participants = set(self.participant_rows.keys())
         self.hear_targets = {cid for cid in participants if cid != self.my_id and cid not in self.muted_participants}
-        self.audio.set_hear_targets(self.hear_targets)
 
     def on_talk_toggled(self, client_id, enabled):
         if client_id == self.my_id:
@@ -597,6 +615,9 @@ class MainWindow(QMainWindow):
         else:
             self.mute_button.setText("Mute Mic")
             self.main_status_bar.showMessage("Microphone unmuted")
+        self_row = self.participant_rows.get(self.my_id)
+        if self_row is not None:
+            self_row.set_mic_status(not muted)
 
     def open_settings(self):
         dlg = SettingsDialog(self.audio, self.server_ip, self.reconnect_to_server, self)
@@ -626,9 +647,6 @@ class MainWindow(QMainWindow):
         if not join_ok:
             self._set_connected_state(False, f"Join failed: {join_resp}")
             return False, join_resp
-
-        if multicast_addr:
-            self.audio.join_multicast(multicast_addr.strip())
 
         self._set_connected_state(True, "Reconnected to server")
         self.refresh_participants()
@@ -665,7 +683,7 @@ class MainWindow(QMainWindow):
         self_row = self.participant_rows.get(self.my_id)
         if self_row is not None:
             self_row.set_volume(mic_level)
-            self_row.set_mic_status(self_speaking)
+            self_row.set_mic_status(not self.audio.tx_muted)
         speaking_state[self.my_id] = self_speaking
 
         prev_self_active = self.speaker_state.get(self.my_id, False)
@@ -680,7 +698,7 @@ class MainWindow(QMainWindow):
         for cid, row in self.participant_rows.items():
             if cid == self.my_id:
                 continue
-            raw_level = float(self.audio.stream_levels.get(cid, 0.0))
+            raw_level = float(self.audio.stream_levels.get("__mixed__", 0.0))
             level = min(100, int((raw_level * 100) / 32767))
             is_active = level >= 2
 
@@ -847,9 +865,6 @@ def main():
         msg.exec()
         audio.shutdown()
         sys.exit(1)
-
-    if multicast_addr:
-        audio.join_multicast(multicast_addr.strip())
 
     print("[CLIENT] Registration successful - starting UI...")
 

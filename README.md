@@ -386,8 +386,10 @@ pyinstaller --noconfirm --clean --onefile --windowed `
 From `server` folder:
 
 ```powershell
-pyinstaller --noconfirm --clean --onefile server.py
+pyinstaller --noconfirm --clean server.spec
 ```
+
+This spec bundles Opus for frozen builds (`..\opus\opus.dll -> opus\opus.dll`), so `server.exe` can start without requiring a separate local DLL copy.
 
 ## 16. Validation Checklist
 
@@ -416,6 +418,12 @@ pyinstaller --noconfirm --clean --onefile server.py
 - Check `Talk` routing or Broadcast state.
 - Ensure receiver has not muted sender.
 - Confirm firewall allows UDP `50002`.
+
+### Server EXE fails with `Could not find opus.dll`
+
+- Cause: EXE was built without bundling Opus runtime DLL.
+- Fix: build from `server` folder using:
+  - `pyinstaller --noconfirm --clean server.spec`
 
 ### Discovery fails
 

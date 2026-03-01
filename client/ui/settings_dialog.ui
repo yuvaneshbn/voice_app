@@ -30,7 +30,6 @@
      <layout class="QFormLayout" name="networkLayout">
       <item row="0" column="0"><widget class="QLabel" name="serverIpTitle"><property name="text"><string>Server IP:</string></property></widget></item>
       <item row="0" column="1"><layout class="QHBoxLayout" name="serverRow"><item><widget class="QLabel" name="serverIpValue"><property name="text"><string>192.168.1.100</string></property></widget></item><item><widget class="QPushButton" name="reconnectButton"><property name="text"><string>Reconnect</string></property></widget></item></layout></item>
-      <item row="1" column="0" colspan="2"><widget class="QCheckBox" name="multicastCheckbox"><property name="text"><string>Enable Multicast for Rooms</string></property></widget></item>
      </layout>
     </widget>
    </item>
