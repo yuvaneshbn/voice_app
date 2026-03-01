@@ -7,6 +7,7 @@ import time
 import traceback
 
 from PySide6.QtCore import QFile, QIODevice, QTimer, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
@@ -45,6 +46,7 @@ MAIN_WINDOW_UI = os.path.join(UI_DIR, "main_window.ui")
 PARTICIPANT_ITEM_UI = os.path.join(UI_DIR, "participant_item.ui")
 SETTINGS_DIALOG_UI = os.path.join(UI_DIR, "settings_dialog.ui")
 VOLUME_CONTROL_UI = os.path.join(UI_DIR, "volume_control.ui")
+APP_ICON_PATH = os.path.join(CLIENT_DIR, "technical-support.ico")
 
 
 def _sort_client_ids(client_id):
@@ -249,6 +251,8 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.form)
 
         self.setWindowTitle(self.form.windowTitle())
+        if os.path.exists(APP_ICON_PATH):
+            self.setWindowIcon(QIcon(APP_ICON_PATH))
 
         self.input_device_combo = self.form.findChild(QComboBox, "inputDeviceCombo")
         self.output_device_combo = self.form.findChild(QComboBox, "outputDeviceCombo")
@@ -352,6 +356,8 @@ class MainWindow(QMainWindow):
         self.root = root
         self.setCentralWidget(root)
         self.setWindowTitle(root.windowTitle())
+        if os.path.exists(APP_ICON_PATH):
+            self.setWindowIcon(QIcon(APP_ICON_PATH))
 
         self.room_combo = root.findChild(QComboBox, "roomCombo")
         self.join_leave_button = root.findChild(QPushButton, "joinLeaveButton")
@@ -799,6 +805,8 @@ def main():
         pass
 
     app = QApplication(sys.argv)
+    if os.path.exists(APP_ICON_PATH):
+        app.setWindowIcon(QIcon(APP_ICON_PATH))
 
     net = Network()
     print("[CLIENT] Discovering server...")

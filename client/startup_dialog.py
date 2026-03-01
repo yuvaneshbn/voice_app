@@ -1,11 +1,14 @@
+import os
 import socket
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton, QMessageBox
 from PySide6.QtCore import Qt
 
 CONTROL_PORT = 50001
 DSCP_CS3 = 24
 IP_TOS_CS3 = DSCP_CS3 << 2
+APP_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "technical-support.ico")
 
 
 class ServerIPDialog(QDialog):
@@ -14,6 +17,8 @@ class ServerIPDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.server_ip = None
+        if os.path.exists(APP_ICON_PATH):
+            self.setWindowIcon(QIcon(APP_ICON_PATH))
         
         self.setWindowTitle("Voice App - Server Not Found")
         self.setGeometry(100, 100, 400, 150)
@@ -55,6 +60,8 @@ class StartupDialog(QDialog):
         self.server_ip = server_ip
         self.audio_port = audio_port
         self.client_id = None
+        if os.path.exists(APP_ICON_PATH):
+            self.setWindowIcon(QIcon(APP_ICON_PATH))
         
         self.setWindowTitle("Voice App - Client Setup")
         self.setGeometry(100, 100, 400, 200)
