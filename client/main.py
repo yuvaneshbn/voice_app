@@ -34,6 +34,10 @@ from startup_dialog import ServerIPDialog, StartupDialog
 CONTROL_PORT = 50001
 DEFAULT_ROOM = "main"
 REGISTER_SECRET = os.getenv("VOICE_REGISTER_SECRET", "mysecret")
+DSCP_EF = 46
+DSCP_CS3 = 24
+IP_TOS_EF = DSCP_EF << 2
+IP_TOS_CS3 = DSCP_CS3 << 2
 
 CLIENT_DIR = os.path.dirname(os.path.abspath(__file__))
 UI_DIR = os.path.join(CLIENT_DIR, "ui")
@@ -63,8 +67,20 @@ def load_ui_widget(ui_path, parent=None):
     return widget
 
 
+def _set_socket_dscp(sock, ip_tos):
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, ip_tos)
+    except OSError:
+        pass
+
+
 def send_control_command(server_ip, command, timeout=5.0):
     ctrl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    _set_socket_dscp(ctrl, IP_TOS_CS3)
+    try:
+        ctrl.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
     ctrl.settimeout(timeout)
     try:
         ctrl.connect((server_ip, CONTROL_PORT))

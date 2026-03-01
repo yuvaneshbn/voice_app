@@ -7,6 +7,8 @@ FRAME = 320  # 20 ms @ 16 kHz (matches OpusCodec default)
 CHUNK = FRAME
 FRAME_MS = int(1000 * FRAME / RATE)
 AUDIO_PORT = 50002
+DSCP_EF = 46
+IP_TOS_EF = DSCP_EF << 2
 
 # Simple jitter buffer targets (ms)
 JITTER_MIN_MS = 20
@@ -23,6 +25,13 @@ MAX_GAIN = 3.0
 MIN_GAIN = 0.5
 
 
+def _set_socket_dscp(sock, ip_tos):
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, ip_tos)
+    except OSError:
+        pass
+
+
 class AudioEngine:
     def __init__(self):
         self.client_id = None
@@ -35,6 +44,7 @@ class AudioEngine:
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        _set_socket_dscp(self.recv_sock, IP_TOS_EF)
 
         # Bind to ephemeral port
         self.recv_sock.bind(("", 0))
@@ -54,6 +64,7 @@ class AudioEngine:
         self.listen_running = True
         self.multicast_running = False
         self.stream_lock = threading.Lock()
+        self.state_lock = threading.Lock()
         self.multicast_sock = None
         self.multicast_group = None
         self.input = None
@@ -258,6 +269,9 @@ class AudioEngine:
     # --------------------------------------------------
 
     def mix(self, frame_bytes):
+        def seq_forward_distance(expected, candidate):
+            return (candidate - expected) & 0xFFFF
+
         samples = [0] * (frame_bytes // 2)
         active = 0
 
@@ -301,11 +315,20 @@ class AudioEngine:
                         continue
                     frames.append((sid, chunk, ts))
                 else:
-                    # Fast resync if we already have a nearby future packet.
+                    # Fast resync if we already have a future packet.
                     if buf:
-                        next_seq = min(buf.keys())
-                        gap = (next_seq - exp) & 0xFFFF
-                        if 0 < gap <= 6 and next_seq in buf:
+                        next_seq = min(buf.keys(), key=lambda k: seq_forward_distance(exp, k))
+                        gap = seq_forward_distance(exp, next_seq)
+
+                        # Small gap: skip ahead immediately.
+                        if 0 < gap <= 8 and next_seq in buf:
+                            ts, chunk, _arr = buf.pop(next_seq)
+                            frames.append((sid, chunk, ts))
+                            self.expected_seq[sid] = (next_seq + 1) & 0xFFFF
+                            continue
+
+                        # Larger discontinuity while buffer has data: jump to head to avoid long PLC streaks.
+                        if gap > 8 and len(buf) >= max(2, target):
                             ts, chunk, _arr = buf.pop(next_seq)
                             frames.append((sid, chunk, ts))
                             self.expected_seq[sid] = (next_seq + 1) & 0xFFFF
@@ -432,6 +455,11 @@ class AudioEngine:
                             self.expected_seq[sender_id] = seq
                             self.playout_ts[sender_id] = ts
                             buf.clear()
+                        elif 40 < forward < 2000:
+                            # Large forward jump likely indicates a burst drop/reset; resync quickly.
+                            self.expected_seq[sender_id] = seq
+                            self.playout_ts[sender_id] = ts
+                            buf.clear()
                     self.last_packet_seq[sender_id] = seq
 
                     buf[seq] = (ts, pcm[:frame_bytes], arrival_time)
@@ -446,7 +474,7 @@ class AudioEngine:
                     if sender_id in self.last_arrival:
                         delta = arrival_time - self.last_arrival[sender_id]
                         expected = FRAME / RATE
-                        jitter = abs(delta - expected)
+                        jitter = min(0.200, abs(delta - expected))
                         prev = self.jitter_est.get(sender_id, jitter)
                         self.jitter_est[sender_id] = 0.9 * prev + 0.1 * jitter
                     self.last_arrival[sender_id] = arrival_time
@@ -495,6 +523,7 @@ class AudioEngine:
         try:
             msock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             msock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            _set_socket_dscp(msock, IP_TOS_EF)
             try:
                 msock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
             except (AttributeError, OSError):
@@ -539,26 +568,54 @@ class AudioEngine:
     # --------------------------------------------------
 
     def start(self, server_ip):
-        if self.running or not self.client_id:
+        if not self.client_id:
             return
 
-        self.running = True
-        self.server_ip = server_ip
-        print(f"[AUDIO] Audio capture ACTIVE for {self.client_id} -> {server_ip}:50002")
+        with self.state_lock:
+            if self.running:
+                return
+            if self.send_thread and self.send_thread.is_alive():
+                self.send_thread.join(timeout=1.0)
+                if self.send_thread.is_alive():
+                    print("[AUDIO] Capture restart skipped: previous send thread still active")
+                    return
 
-        input_kwargs = dict(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=RATE,
-            input=True,
-            frames_per_buffer=CHUNK,
-        )
-        if self.input_device_index is not None:
-            input_kwargs["input_device_index"] = self.input_device_index
-        self.input = self.audio.open(**input_kwargs)
+            self.running = True
+            self.server_ip = server_ip
+            print(f"[AUDIO] Audio capture ACTIVE for {self.client_id} -> {server_ip}:50002")
 
-        self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        try:
+            input_kwargs = dict(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK,
+            )
+            if self.input_device_index is not None:
+                input_kwargs["input_device_index"] = self.input_device_index
+            self.input = self.audio.open(**input_kwargs)
+
+            self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+            _set_socket_dscp(self.send_sock, IP_TOS_EF)
+        except Exception as e:
+            with self.state_lock:
+                self.running = False
+            try:
+                if self.input is not None:
+                    self.input.close()
+            except Exception:
+                pass
+            self.input = None
+            try:
+                if self.send_sock is not None:
+                    self.send_sock.close()
+            except Exception:
+                pass
+            self.send_sock = None
+            print(f"[AUDIO] Failed to start capture: {e}")
+            return
 
         def send():
             packet_count = 0
@@ -626,11 +683,14 @@ class AudioEngine:
 
     def stop(self):
         # Stop capture only (keep receive/output alive)
-        self.running = False
+        with self.state_lock:
+            self.running = False
+            send_thread = self.send_thread
+            self.send_thread = None
         self.capture_active = False
         self.capture_level = 0
-        if self.send_thread and self.send_thread.is_alive():
-            self.send_thread.join(timeout=1.0)
+        if send_thread and send_thread.is_alive():
+            send_thread.join(timeout=1.5)
 
         try:
             if self.input is not None:

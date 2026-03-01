@@ -14,6 +14,17 @@ MULTICAST_BASE = "239.0.0."
 MULTICAST_TTL = 1
 CLIENT_TIMEOUT_SEC = 30
 SERVER_SECRET = "mysecret"
+DSCP_EF = 46
+DSCP_CS3 = 24
+IP_TOS_EF = DSCP_EF << 2
+IP_TOS_CS3 = DSCP_CS3 << 2
+
+
+def _set_socket_dscp(sock, ip_tos):
+    try:
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, ip_tos)
+    except OSError:
+        pass
 
 
 class Client:
@@ -52,6 +63,7 @@ class VoiceServer:
     def broadcast_server(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        _set_socket_dscp(s, IP_TOS_CS3)
         while True:
             try:
                 s.sendto(b"VOICE_SERVER", ("<broadcast>", DISCOVERY_PORT))
@@ -63,6 +75,13 @@ class VoiceServer:
         peer = writer.get_extra_info("peername")
         peer_ip = peer[0] if peer else "0.0.0.0"
         response = b"ERR\n"
+        ctrl_sock = writer.get_extra_info("socket")
+        if ctrl_sock is not None:
+            _set_socket_dscp(ctrl_sock, IP_TOS_CS3)
+            try:
+                ctrl_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
 
         try:
             raw = await reader.readline()
@@ -166,6 +185,7 @@ class VoiceServer:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+        _set_socket_dscp(sock, IP_TOS_EF)
         sock.bind(("0.0.0.0", AUDIO_PORT))
         sock.setblocking(False)
 
@@ -227,6 +247,7 @@ class VoiceServer:
             if msock is None:
                 msock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 msock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, MULTICAST_TTL)
+                _set_socket_dscp(msock, IP_TOS_EF)
                 msock.setblocking(False)
                 self.multicast_socks[sender.room] = msock
             try:
@@ -245,6 +266,12 @@ class VoiceServer:
         threading.Thread(target=self.broadcast_server, daemon=True, name="discovery-broadcast").start()
 
         control_server = await asyncio.start_server(self.handle_control, "0.0.0.0", CONTROL_PORT)
+        for s in control_server.sockets or []:
+            _set_socket_dscp(s, IP_TOS_CS3)
+            try:
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
         logging.info("Control TCP listening on port %s", CONTROL_PORT)
 
         asyncio.create_task(self.prune_dead_clients())

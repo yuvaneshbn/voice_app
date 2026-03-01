@@ -4,6 +4,8 @@ from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEd
 from PySide6.QtCore import Qt
 
 CONTROL_PORT = 50001
+DSCP_CS3 = 24
+IP_TOS_CS3 = DSCP_CS3 << 2
 
 
 class ServerIPDialog(QDialog):
@@ -117,6 +119,11 @@ class StartupDialog(QDialog):
 
     def _is_name_available(self, candidate):
         ctrl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            ctrl.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, IP_TOS_CS3)
+            ctrl.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
         ctrl.settimeout(2.5)
         try:
             ctrl.connect((self.server_ip, CONTROL_PORT))

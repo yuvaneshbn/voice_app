@@ -4,6 +4,10 @@ import time
 DISCOVERY_PORT = 50000
 DISCOVERY_MAGIC = b"VOICE_SERVER"
 DISCOVER_REQUEST = b"VOICE_DISCOVER"
+DSCP_EF = 46
+DSCP_CS3 = 24
+IP_TOS_EF = DSCP_EF << 2
+IP_TOS_CS3 = DSCP_CS3 << 2
 
 class Network:
     def __init__(self):
@@ -22,9 +26,9 @@ class Network:
             # SO_REUSEPORT not available on Windows, that's OK
             pass
 
-        # DSCP EF (46 << 2 = 184)
+        # Discovery is control-plane traffic, not real-time media.
         try:
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, 184)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, IP_TOS_CS3)
         except OSError:
             pass
 
