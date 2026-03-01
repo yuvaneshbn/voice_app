@@ -1,25 +1,66 @@
-import faulthandler
+﻿import faulthandler
 import os
 import socket
 import sys
-import time
 import threading
+import time
 import traceback
 
-from PySide6.QtWidgets import QApplication, QDialog, QMainWindow
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QFile, QIODevice, QTimer, Signal
+from PySide6.QtUiTools import QUiLoader
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSlider,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 from audio import AudioEngine
 from network import Network
 from startup_dialog import ServerIPDialog, StartupDialog
-from voice_ui import Ui_project1
 
-ACTIVE = "QPushButton { background:#2ecc71; color:white; }"
-INACTIVE = "QPushButton { background:#dddddd; }"
-SELF = "QPushButton { background:#3498db; color:white; }"
 CONTROL_PORT = 50001
 DEFAULT_ROOM = "main"
 REGISTER_SECRET = os.getenv("VOICE_REGISTER_SECRET", "mysecret")
+
+CLIENT_DIR = os.path.dirname(os.path.abspath(__file__))
+UI_DIR = os.path.join(CLIENT_DIR, "ui")
+MAIN_WINDOW_UI = os.path.join(UI_DIR, "main_window.ui")
+PARTICIPANT_ITEM_UI = os.path.join(UI_DIR, "participant_item.ui")
+SETTINGS_DIALOG_UI = os.path.join(UI_DIR, "settings_dialog.ui")
+VOLUME_CONTROL_UI = os.path.join(UI_DIR, "volume_control.ui")
+
+
+def _sort_client_ids(client_id):
+    if str(client_id).isdigit():
+        return (0, int(client_id))
+    return (1, str(client_id))
+
+
+def load_ui_widget(ui_path, parent=None):
+    loader = QUiLoader()
+    ui_file = QFile(ui_path)
+    if not ui_file.open(QIODevice.ReadOnly):
+        raise RuntimeError(f"Unable to open UI file: {ui_path}")
+    try:
+        widget = loader.load(ui_file, parent)
+    finally:
+        ui_file.close()
+    if widget is None:
+        raise RuntimeError(f"Unable to load UI file: {ui_path}")
+    return widget
 
 
 def send_control_command(server_ip, command, timeout=5.0):
@@ -36,169 +77,645 @@ def send_control_command(server_ip, command, timeout=5.0):
         ctrl.close()
 
 
+def join_room(server_ip, client_id, room_id=DEFAULT_ROOM):
+    ok, join_response = send_control_command(server_ip, f"JOIN:{client_id}:{room_id}")
+    if not ok or not join_response.startswith("OK"):
+        return False, None, join_response
+    multicast_addr = None
+    if ":" in join_response:
+        _, multicast_addr = join_response.split(":", 1)
+    return True, multicast_addr, join_response
+
+
+class VolumeControlPanel:
+    def __init__(self, audio, parent=None):
+        self.audio = audio
+        self.widget = load_ui_widget(VOLUME_CONTROL_UI, parent)
+
+        self.master_slider = self.widget.findChild(QSlider, "masterSlider")
+        self.gain_slider = self.widget.findChild(QSlider, "gainSlider")
+        self.output_slider = self.widget.findChild(QSlider, "outputSlider")
+        self.mic_sensitivity_slider = self.widget.findChild(QSlider, "micSensitivitySlider")
+        self.noise_suppression_slider = self.widget.findChild(QSlider, "noiseSuppressionSlider")
+        self.auto_gain_checkbox = self.widget.findChild(QCheckBox, "autoGainCheckbox")
+        self.echo_checkbox = self.widget.findChild(QCheckBox, "echoCheckbox")
+        self.test_mic_button = self.widget.findChild(QPushButton, "testMicButton")
+        self.test_status_label = self.widget.findChild(QLabel, "testStatusLabel")
+        self.mic_level_bar = self.widget.findChild(QProgressBar, "micLevelBar")
+
+        self._configure_controls()
+        self._wire_signals()
+
+    def _configure_controls(self):
+        for slider, default_value in (
+            (self.master_slider, int(self.audio.master_volume * 100)),
+            (self.output_slider, int(self.audio.output_volume * 100)),
+            (self.mic_sensitivity_slider, int(self.audio.mic_sensitivity)),
+            (self.noise_suppression_slider, int(self.audio.noise_suppression)),
+        ):
+            if slider is not None:
+                slider.setMinimum(0)
+                slider.setMaximum(100)
+                slider.setValue(default_value)
+
+        if self.gain_slider is not None:
+            self.gain_slider.setValue(int(self.audio.tx_gain_db))
+
+        if self.auto_gain_checkbox is not None:
+            self.auto_gain_checkbox.setChecked(self.audio.auto_gain)
+
+        if self.echo_checkbox is not None:
+            self.echo_checkbox.setChecked(self.audio.echo_enabled)
+            self.echo_checkbox.setEnabled(self.audio.echo is not None)
+
+        if self.mic_level_bar is not None:
+            self.mic_level_bar.setMinimum(0)
+            self.mic_level_bar.setMaximum(100)
+            self.mic_level_bar.setValue(0)
+
+    def _wire_signals(self):
+        if self.master_slider is not None:
+            self.master_slider.valueChanged.connect(self.audio.set_master_volume)
+
+        if self.output_slider is not None:
+            self.output_slider.valueChanged.connect(self.audio.set_output_volume)
+
+        if self.gain_slider is not None:
+            self.gain_slider.valueChanged.connect(self.audio.set_gain_db)
+
+        if self.mic_sensitivity_slider is not None:
+            self.mic_sensitivity_slider.valueChanged.connect(self.audio.set_mic_sensitivity)
+
+        if self.noise_suppression_slider is not None:
+            self.noise_suppression_slider.valueChanged.connect(self.audio.set_noise_suppression)
+
+        if self.auto_gain_checkbox is not None:
+            self.auto_gain_checkbox.toggled.connect(self.audio.set_auto_gain)
+
+        if self.echo_checkbox is not None:
+            self.echo_checkbox.toggled.connect(self.audio.set_echo_enabled)
+
+        if self.test_mic_button is not None:
+            self.test_mic_button.clicked.connect(self._test_microphone)
+
+    def _test_microphone(self):
+        level = self.audio.test_microphone_level(0.8)
+        self.set_mic_level(level)
+        if self.test_status_label is not None:
+            self.test_status_label.setText(f"Mic level: {level}%")
+
+    def set_mic_level(self, level):
+        if self.mic_level_bar is not None:
+            self.mic_level_bar.setValue(max(0, min(100, int(level))))
+
+
+class ParticipantRow:
+    def __init__(self, client_id, is_self, talk_checked, mute_checked, talk_cb, mute_cb, parent=None):
+        self.client_id = str(client_id)
+        self.is_self = is_self
+        self.widget = load_ui_widget(PARTICIPANT_ITEM_UI, parent)
+
+        self.name_label = self.widget.findChild(QLabel, "participantName")
+        self.talk_checkbox = self.widget.findChild(QCheckBox, "talkCheckbox")
+        self.mute_checkbox = self.widget.findChild(QCheckBox, "hearCheckbox")
+        self.mic_status_label = self.widget.findChild(QLabel, "micStatusLabel")
+        self.volume_bar = self.widget.findChild(QProgressBar, "participantVolumeBar")
+
+        name_text = f"Client {self.client_id}"
+        if self.is_self:
+            name_text += " (You)"
+        self.name_label.setText(name_text)
+
+        self.talk_checkbox.setChecked(bool(talk_checked))
+        self.talk_checkbox.setEnabled(not self.is_self)
+
+        self.mute_checkbox.setText("Mute")
+        self.mute_checkbox.setChecked(bool(mute_checked))
+        self.mute_checkbox.setEnabled(not self.is_self)
+
+        self.mic_status_label.setText("Mic: Off")
+        self.volume_bar.setMinimum(0)
+        self.volume_bar.setMaximum(100)
+        self.volume_bar.setValue(0)
+
+        self.talk_checkbox.toggled.connect(lambda checked: talk_cb(self.client_id, checked))
+        self.mute_checkbox.toggled.connect(lambda checked: mute_cb(self.client_id, checked))
+
+    def set_talk_checked(self, enabled):
+        if self.talk_checkbox.isChecked() != bool(enabled):
+            self.talk_checkbox.blockSignals(True)
+            self.talk_checkbox.setChecked(bool(enabled))
+            self.talk_checkbox.blockSignals(False)
+
+    def set_mute_checked(self, enabled):
+        if self.mute_checkbox.isChecked() != bool(enabled):
+            self.mute_checkbox.blockSignals(True)
+            self.mute_checkbox.setChecked(bool(enabled))
+            self.mute_checkbox.blockSignals(False)
+
+    def set_volume(self, value):
+        self.volume_bar.setValue(max(0, min(100, int(value))))
+
+    def set_mic_status(self, is_on):
+        self.mic_status_label.setText("Mic: On" if is_on else "Mic: Off")
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, audio, server_ip, reconnect_cb, parent=None):
+        super().__init__(parent)
+        self.audio = audio
+        self.server_ip = server_ip
+        self.reconnect_cb = reconnect_cb
+
+        self.form = load_ui_widget(SETTINGS_DIALOG_UI, self)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.form)
+
+        self.setWindowTitle(self.form.windowTitle())
+
+        self.input_device_combo = self.form.findChild(QComboBox, "inputDeviceCombo")
+        self.output_device_combo = self.form.findChild(QComboBox, "outputDeviceCombo")
+        self.server_ip_value = self.form.findChild(QLabel, "serverIpValue")
+        self.reconnect_button = self.form.findChild(QPushButton, "reconnectButton")
+        self.save_close_button = self.form.findChild(QPushButton, "saveCloseButton")
+        self.cancel_button = self.form.findChild(QPushButton, "cancelButton")
+
+        self.advanced_audio_layout = self.form.findChild(QVBoxLayout, "advancedAudioLayout")
+        self.volume_hint = self.form.findChild(QLabel, "volumeControlHint")
+
+        self.volume_controls = VolumeControlPanel(self.audio, self.form)
+        if self.volume_hint is not None:
+            self.volume_hint.setParent(None)
+        if self.advanced_audio_layout is not None:
+            self.advanced_audio_layout.addWidget(self.volume_controls.widget)
+
+        if self.server_ip_value is not None:
+            self.server_ip_value.setText(self.server_ip)
+
+        self._populate_devices()
+
+        self.reconnect_button.clicked.connect(self._reconnect)
+        self.save_close_button.clicked.connect(self._save_and_close)
+        self.cancel_button.clicked.connect(self.reject)
+
+    def _populate_devices(self):
+        input_devices = self.audio.list_input_devices()
+        output_devices = self.audio.list_output_devices()
+
+        for idx, name in input_devices:
+            self.input_device_combo.addItem(name, idx)
+
+        for idx, name in output_devices:
+            self.output_device_combo.addItem(name, idx)
+
+        if self.audio.input_device_index is not None:
+            pos = self.input_device_combo.findData(self.audio.input_device_index)
+            if pos >= 0:
+                self.input_device_combo.setCurrentIndex(pos)
+
+        if self.audio.output_device_index is not None:
+            pos = self.output_device_combo.findData(self.audio.output_device_index)
+            if pos >= 0:
+                self.output_device_combo.setCurrentIndex(pos)
+
+    def _reconnect(self):
+        ok, message = self.reconnect_cb()
+        box = QMessageBox(self)
+        box.setWindowTitle("Reconnect")
+        if ok:
+            box.setIcon(QMessageBox.Information)
+            box.setText("Reconnected successfully.")
+            if message:
+                box.setInformativeText(message)
+        else:
+            box.setIcon(QMessageBox.Warning)
+            box.setText("Reconnect failed.")
+            if message:
+                box.setInformativeText(message)
+        box.exec()
+
+    def _save_and_close(self):
+        input_device = self.input_device_combo.currentData()
+        output_device = self.output_device_combo.currentData()
+
+        if input_device is not None:
+            self.audio.set_input_device(input_device)
+
+        if output_device is not None:
+            self.audio.set_output_device(output_device)
+
+        self.accept()
+
+
 class MainWindow(QMainWindow):
+    heartbeat_result = Signal(bool)
+
     def __init__(self, my_id, server_ip, audio):
         super().__init__()
-        self.ui = Ui_project1()
-        self.ui.setupUi(self)
-        self.setFixedSize(730, 475)
 
-        self.my_id = my_id
+        self.my_id = str(my_id)
         self.server_ip = server_ip
         self.audio = audio
-        self.audio.client_id = my_id
+        self.audio.client_id = self.my_id
+
         self.targets = set()
+        self.muted_participants = set()
+        self.hear_targets = set()
+        self.participant_rows = {}
+        self.speaker_state = {}
+
+        self.connected = True
         self.registration_successful = True
-
-        self.talk_buttons = {
-            "1": self.ui.cl1talkbtn,
-            "2": self.ui.cl2talkbtn,
-            "3": self.ui.cl3talkbtn,
-            "4": self.ui.client4talkbtn,
-        }
-
-        self.hear_targets = set(self.talk_buttons.keys()) - {self.my_id}
-
-        self.hear_buttons = {
-            "1": self.ui.cl1hearbtn,
-            "2": self.ui.cl2hearbtn,
-            "3": self.ui.cl3hearbtn,
-            "4": self.ui.cl4hearbtn,
-        }
-
-        self.enable_all_controls()
-
-        for cid, btn in self.talk_buttons.items():
-            btn.setCheckable(True)
-            btn.setStyleSheet(INACTIVE)
-            btn.clicked.connect(lambda _, c=cid: self.toggle_target(c))
-
-        for cid, btn in self.hear_buttons.items():
-            btn.setCheckable(True)
-            btn.setStyleSheet(INACTIVE if cid != self.my_id else SELF)
-            btn.setChecked(cid != self.my_id)
-            btn.clicked.connect(lambda _, c=cid: self.toggle_hear(c))
-            if cid == self.my_id:
-                btn.setEnabled(False)
-
-        self.talk_buttons[self.my_id].setStyleSheet(SELF)
-        self.talk_buttons[self.my_id].setEnabled(False)
-
-        self.ui.talkbtn.clicked.connect(self.broadcast)
-        self.ui.statusbar.showMessage(f"You are Client {self.my_id} - Connected")
-
-        self.audio.set_hear_targets(self.hear_targets)
+        self._heartbeat_failures = 0
         self._hb_stop = threading.Event()
-        threading.Thread(target=self.heartbeat_loop, daemon=True, name="heartbeat").start()
+        self._unregistered = False
+        self._cleaned_up = False
+
+        root = load_ui_widget(MAIN_WINDOW_UI, self)
+        self.root = root
+        self.setCentralWidget(root)
+        self.setWindowTitle(root.windowTitle())
+
+        self.room_combo = root.findChild(QComboBox, "roomCombo")
+        self.join_leave_button = root.findChild(QPushButton, "joinLeaveButton")
+        self.refresh_button = root.findChild(QPushButton, "refreshButton")
+        self.connection_indicator = root.findChild(QLabel, "connectionIndicator")
+
+        self.search_input = root.findChild(QLineEdit, "searchInput")
+        self.participant_list = root.findChild(QListWidget, "participantList")
+        self.count_label = root.findChild(QLabel, "countLabel")
+
+        self.active_speakers_label = root.findChild(QLabel, "activeSpeakersLabel")
+        self.speaker_log_list = root.findChild(QListWidget, "speakerLogList")
+        self.system_level_bar = root.findChild(QProgressBar, "systemLevelBar")
+
+        self.controls_layout = root.findChild(QVBoxLayout, "controlsPlaceholderLayout")
+        self.controls_hint = root.findChild(QLabel, "controlsHint")
+
+        self.mute_button = root.findChild(QPushButton, "muteButton")
+        self.broadcast_button = root.findChild(QPushButton, "broadcastButton")
+        self.settings_button = root.findChild(QPushButton, "settingsButton")
+
+        self.warning_label = root.findChild(QLabel, "warningLabel")
+        self.main_status_bar = root.findChild(QStatusBar, "mainStatusBar")
+
+        self.volume_controls = VolumeControlPanel(self.audio, root)
+        if self.controls_hint is not None:
+            self.controls_hint.setParent(None)
+        if self.controls_layout is not None:
+            self.controls_layout.addWidget(self.volume_controls.widget)
+
+        self.room_combo.clear()
+        self.room_combo.addItem(DEFAULT_ROOM)
+        self.room_combo.setCurrentText(DEFAULT_ROOM)
+        self.room_combo.setEnabled(False)
+
+        self.join_leave_button.setText("Leave Room")
+        self.join_leave_button.clicked.connect(self.leave_room_and_exit)
+
+        self.refresh_button.clicked.connect(self.refresh_participants)
+        self.search_input.textChanged.connect(self.apply_search_filter)
+
+        self.mute_button.setCheckable(True)
+        self.mute_button.toggled.connect(self.toggle_self_mute)
+        self.broadcast_button.setCheckable(True)
+        self.broadcast_button.setChecked(False)
+        self.broadcast_button.setText("Broadcast Off")
+        self.broadcast_button.toggled.connect(self.toggle_broadcast)
+        self.settings_button.clicked.connect(self.open_settings)
+
         self._stop_capture_timer = QTimer(self)
         self._stop_capture_timer.setSingleShot(True)
         self._stop_capture_timer.setInterval(1200)
         self._stop_capture_timer.timeout.connect(self._stop_capture_if_idle)
 
-    def disable_all_controls(self):
-        for btn in self.talk_buttons.values():
-            btn.setEnabled(False)
-        for btn in self.hear_buttons.values():
-            btn.setEnabled(False)
-        self.ui.talkbtn.setEnabled(False)
-        self.ui.statusbar.showMessage(f"You are Client {self.my_id} - Registering...")
+        self._ui_timer = QTimer(self)
+        self._ui_timer.setInterval(200)
+        self._ui_timer.timeout.connect(self.update_live_ui)
+        self._ui_timer.start()
+        self.heartbeat_result.connect(self._handle_heartbeat)
 
-    def enable_all_controls(self):
-        for cid, btn in self.talk_buttons.items():
-            if cid != self.my_id:
-                btn.setEnabled(True)
-        for cid, btn in self.hear_buttons.items():
-            if cid != self.my_id:
-                btn.setEnabled(True)
-        self.ui.talkbtn.setEnabled(True)
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setInterval(3000)
+        self._auto_refresh_timer.timeout.connect(lambda: self.refresh_participants(silent=True))
+        self._auto_refresh_timer.start()
 
-    def toggle_target(self, cid):
-        if cid == self.my_id or not self.registration_successful:
+        self.system_level_bar.setMinimum(0)
+        self.system_level_bar.setMaximum(100)
+        self.system_level_bar.setValue(0)
+
+        self.main_status_bar.showMessage(f"Client {self.my_id} connected to {self.server_ip}")
+        self._set_connected_state(True)
+
+        self.refresh_participants()
+        threading.Thread(target=self.heartbeat_loop, daemon=True, name="heartbeat").start()
+
+    def _set_connected_state(self, connected, detail=""):
+        self.connected = bool(connected)
+        if self.connected:
+            self.connection_indicator.setText("Connected")
+            self.connection_indicator.setStyleSheet("color:#1E8E3E; font-weight:bold;")
+            if detail:
+                self.main_status_bar.showMessage(detail)
+            self.warning_label.setText("")
+        else:
+            self.connection_indicator.setText("Disconnected")
+            self.connection_indicator.setStyleSheet("color:#C62828; font-weight:bold;")
+            message = detail or "Server unreachable"
+            self.warning_label.setText(message)
+            self.main_status_bar.showMessage(message)
+
+    def _participants_from_server(self):
+        ok, response = send_control_command(self.server_ip, f"LIST:{self.my_id}")
+        if not ok:
+            return None, response
+
+        participants = [cid.strip() for cid in response.split(",") if cid.strip()]
+        if self.my_id not in participants:
+            participants.append(self.my_id)
+
+        participants = sorted(set(participants), key=_sort_client_ids)
+        return participants, ""
+
+    def refresh_participants(self, silent=False):
+        participants, error = self._participants_from_server()
+        if participants is None:
+            if not silent:
+                self._set_connected_state(False, f"Refresh failed: {error}")
             return
 
-        btn = self.talk_buttons[cid]
-        if btn.isChecked():
-            self.targets.add(cid)
-            btn.setStyleSheet(ACTIVE)
+        if not silent:
+            self._set_connected_state(True, "Participant list refreshed")
+        elif not self.connected:
+            self._set_connected_state(True, "Connection restored")
+
+        self.targets.intersection_update(participants)
+        self.muted_participants.intersection_update(participants)
+
+        self.participant_rows.clear()
+        self.participant_list.clear()
+
+        for cid in participants:
+            row = ParticipantRow(
+                client_id=cid,
+                is_self=(cid == self.my_id),
+                talk_checked=(cid in self.targets),
+                mute_checked=(cid in self.muted_participants),
+                talk_cb=self.on_talk_toggled,
+                mute_cb=self.on_mute_toggled,
+                parent=self.participant_list,
+            )
+            item = QListWidgetItem()
+            item.setSizeHint(row.widget.sizeHint())
+            self.participant_list.addItem(item)
+            self.participant_list.setItemWidget(item, row.widget)
+            self.participant_rows[cid] = row
+
+        self._recompute_hear_targets()
+        self._sync_broadcast_button()
+        self.apply_search_filter()
+
+    def apply_search_filter(self):
+        query = self.search_input.text().strip().lower()
+        shown = 0
+        total = self.participant_list.count()
+
+        for i in range(total):
+            item = self.participant_list.item(i)
+            widget = self.participant_list.itemWidget(item)
+            name_label = widget.findChild(QLabel, "participantName") if widget else None
+            text = name_label.text().lower() if name_label else ""
+            visible = (query in text) if query else True
+            item.setHidden(not visible)
+            if visible:
+                shown += 1
+
+        self.count_label.setText(f"{shown} / {total} shown")
+
+    def _recompute_hear_targets(self):
+        participants = set(self.participant_rows.keys())
+        self.hear_targets = {cid for cid in participants if cid != self.my_id and cid not in self.muted_participants}
+        self.audio.set_hear_targets(self.hear_targets)
+
+    def on_talk_toggled(self, client_id, enabled):
+        if client_id == self.my_id:
+            return
+
+        if enabled:
+            self.targets.add(client_id)
         else:
-            self.targets.discard(cid)
-            btn.setStyleSheet(INACTIVE)
+            self.targets.discard(client_id)
 
         self.update_targets()
 
-    def toggle_hear(self, cid):
-        if cid == self.my_id or not self.registration_successful:
+    def on_mute_toggled(self, client_id, enabled):
+        if client_id == self.my_id:
             return
 
-        btn = self.hear_buttons[cid]
-        if btn.isChecked():
-            self.hear_targets.add(cid)
-            btn.setStyleSheet(ACTIVE)
+        if enabled:
+            self.muted_participants.add(client_id)
         else:
-            self.hear_targets.discard(cid)
-            btn.setStyleSheet(INACTIVE)
+            self.muted_participants.discard(client_id)
 
-        self.audio.set_hear_targets(self.hear_targets)
+        self._recompute_hear_targets()
 
     def update_targets(self):
-        if not self.registration_successful:
-            return
-
         if self.targets and not self.audio.running:
             if self._stop_capture_timer.isActive():
                 self._stop_capture_timer.stop()
             self.audio.start(self.server_ip)
         elif not self.targets and self.audio.running and not self._stop_capture_timer.isActive():
-            # Debounce stop to avoid capture churn when users quickly toggle targets.
             self._stop_capture_timer.start()
 
-        targets = ",".join(sorted(self.targets))
+        targets = ",".join(sorted(self.targets, key=_sort_client_ids))
         ok, response = send_control_command(self.server_ip, f"TARGETS:{self.my_id}:{targets}")
-        if not ok or response != "OK":
-            print(f"[CLIENT] Failed to update targets: {response}")
-            self.ui.statusbar.showMessage(f"You are Client {self.my_id} - Connection issue")
+        if ok and response == "OK":
+            self._set_connected_state(True)
+        else:
+            self._set_connected_state(False, f"Failed to update targets: {response}")
+        self._sync_broadcast_button()
 
     def _stop_capture_if_idle(self):
         if not self.targets and self.audio.running:
             self.audio.stop()
 
+    def _all_other_clients(self):
+        return {cid for cid in self.participant_rows.keys() if cid != self.my_id}
+
+    def _sync_broadcast_button(self):
+        all_targets = self._all_other_clients()
+        is_broadcast = bool(all_targets) and self.targets == all_targets
+        self.broadcast_button.blockSignals(True)
+        self.broadcast_button.setChecked(is_broadcast)
+        self.broadcast_button.setText("Broadcast On" if is_broadcast else "Broadcast Off")
+        self.broadcast_button.blockSignals(False)
+
+    def toggle_broadcast(self, enabled):
+        all_targets = self._all_other_clients()
+        if enabled and not all_targets:
+            self.broadcast_button.blockSignals(True)
+            self.broadcast_button.setChecked(False)
+            self.broadcast_button.setText("Broadcast Off")
+            self.broadcast_button.blockSignals(False)
+            return
+
+        self.targets = set(all_targets) if enabled else set()
+        for cid, row in self.participant_rows.items():
+            if cid == self.my_id:
+                continue
+            row.set_talk_checked(cid in self.targets)
+        self.update_targets()
+
+    def toggle_self_mute(self, muted):
+        self.audio.set_tx_muted(muted)
+        if muted:
+            self.mute_button.setText("Unmute Mic")
+            self.main_status_bar.showMessage("Microphone muted")
+        else:
+            self.mute_button.setText("Mute Mic")
+            self.main_status_bar.showMessage("Microphone unmuted")
+
+    def open_settings(self):
+        dlg = SettingsDialog(self.audio, self.server_ip, self.reconnect_to_server, self)
+        dlg.exec()
+
+    def reconnect_to_server(self):
+        ok, response = send_control_command(self.server_ip, f"PING:{self.my_id}", timeout=3.0)
+        if ok and response == "OK":
+            self._set_connected_state(True, "Connection healthy")
+            self.refresh_participants()
+            return True, "Connection already active."
+
+        reg_ok, reg_resp = send_control_command(
+            self.server_ip,
+            f"REGISTER:{self.my_id}:{self.audio.port}:{REGISTER_SECRET}",
+            timeout=5.0,
+        )
+        if not reg_ok:
+            self._set_connected_state(False, f"Reconnect failed: {reg_resp}")
+            return False, reg_resp
+
+        if reg_resp not in ("OK", "TAKEN"):
+            self._set_connected_state(False, f"Reconnect failed: {reg_resp}")
+            return False, reg_resp
+
+        join_ok, multicast_addr, join_resp = join_room(self.server_ip, self.my_id, DEFAULT_ROOM)
+        if not join_ok:
+            self._set_connected_state(False, f"Join failed: {join_resp}")
+            return False, join_resp
+
+        if multicast_addr:
+            self.audio.join_multicast(multicast_addr.strip())
+
+        self._set_connected_state(True, "Reconnected to server")
+        self.refresh_participants()
+        return True, "Re-registered and joined room main."
+
     def heartbeat_loop(self):
         while not self._hb_stop.is_set():
             ok, response = send_control_command(self.server_ip, f"PING:{self.my_id}", timeout=3.0)
-            if not ok or response != "OK":
-                print(f"[CLIENT] Heartbeat failed: {response}")
-            self._hb_stop.wait(10.0)
+            alive = ok and response == "OK"
+            self.heartbeat_result.emit(alive)
+            self._hb_stop.wait(8.0)
 
-    def broadcast(self):
-        if not self.registration_successful:
+    def _handle_heartbeat(self, alive):
+        if self._cleaned_up:
             return
 
-        all_targets = set(self.talk_buttons.keys()) - {self.my_id}
-
-        if self.targets == all_targets:
-            self.targets = set()
-            for cid in all_targets:
-                self.talk_buttons[cid].setChecked(False)
-                self.talk_buttons[cid].setStyleSheet(INACTIVE)
+        if alive:
+            self._heartbeat_failures = 0
+            if not self.connected:
+                self._set_connected_state(True, "Connection restored")
         else:
-            self.targets = all_targets
-            for cid in all_targets:
-                self.talk_buttons[cid].setChecked(True)
-                self.talk_buttons[cid].setStyleSheet(ACTIVE)
+            self._heartbeat_failures += 1
+            if self._heartbeat_failures >= 2:
+                self._set_connected_state(False, "Disconnected from server")
 
-        self.update_targets()
+    def update_live_ui(self):
+        mic_level = self.audio.capture_level
+        self.system_level_bar.setValue(mic_level)
+        self.volume_controls.set_mic_level(mic_level)
+
+        speaking_state = {}
+        # Track self speaking state so active speaker UI can show all current speakers.
+        self_speaking = bool(self.audio.capture_active and not self.audio.tx_muted)
+        self_row = self.participant_rows.get(self.my_id)
+        if self_row is not None:
+            self_row.set_volume(mic_level)
+            self_row.set_mic_status(self_speaking)
+        speaking_state[self.my_id] = self_speaking
+
+        prev_self_active = self.speaker_state.get(self.my_id, False)
+        if self_speaking and not prev_self_active:
+            timestamp = time.strftime("%H:%M:%S")
+            self.speaker_log_list.addItem(f"[{timestamp}] Client {self.my_id} speaking")
+        elif prev_self_active and not self_speaking:
+            timestamp = time.strftime("%H:%M:%S")
+            self.speaker_log_list.addItem(f"[{timestamp}] Client {self.my_id} stopped")
+        self.speaker_state[self.my_id] = self_speaking
+
+        for cid, row in self.participant_rows.items():
+            if cid == self.my_id:
+                continue
+            raw_level = float(self.audio.stream_levels.get(cid, 0.0))
+            level = min(100, int((raw_level * 100) / 32767))
+            is_active = level >= 2
+
+            row.set_volume(level)
+            row.set_mic_status(is_active)
+
+            was_active = self.speaker_state.get(cid, False)
+            if is_active and not was_active:
+                timestamp = time.strftime("%H:%M:%S")
+                self.speaker_log_list.addItem(f"[{timestamp}] Client {cid} speaking")
+            elif was_active and not is_active:
+                timestamp = time.strftime("%H:%M:%S")
+                self.speaker_log_list.addItem(f"[{timestamp}] Client {cid} stopped")
+            while self.speaker_log_list.count() > 200:
+                self.speaker_log_list.takeItem(0)
+
+            self.speaker_state[cid] = is_active
+            speaking_state[cid] = is_active
+
+        status_lines = []
+        for cid in sorted(self.participant_rows.keys(), key=_sort_client_ids):
+            state = "talking" if speaking_state.get(cid, False) else "listening"
+            status_lines.append(f"Client {cid} - {state}")
+
+        self.active_speakers_label.setText("\n".join(status_lines) if status_lines else "No clients")
+
+    def leave_room_and_exit(self):
+        self._cleanup(unregister=True)
+        self.close()
+
+    def _cleanup(self, unregister=True):
+        if self._cleaned_up:
+            return
+
+        self._cleaned_up = True
+        self._hb_stop.set()
+
+        if self._ui_timer.isActive():
+            self._ui_timer.stop()
+
+        if self._auto_refresh_timer.isActive():
+            self._auto_refresh_timer.stop()
+
+        if self._stop_capture_timer.isActive():
+            self._stop_capture_timer.stop()
+
+        if unregister and not self._unregistered:
+            try:
+                send_control_command(self.server_ip, f"UNREGISTER:{self.my_id}")
+            except Exception:
+                pass
+            self._unregistered = True
+
+        self.audio.shutdown()
 
     def closeEvent(self, event):
-        try:
-            self._hb_stop.set()
-            if self._stop_capture_timer.isActive():
-                self._stop_capture_timer.stop()
-            send_control_command(self.server_ip, f"UNREGISTER:{self.my_id}")
-            print(f"[CLIENT] Sent unregistration: {self.my_id}")
-        except Exception as e:
-            print(f"[CLIENT] Unregistration error: {e}")
-
-        self.audio.stop()
+        self._cleanup(unregister=True)
         event.accept()
 
 
@@ -220,14 +737,10 @@ def register_client_with_server(client_id, server_ip, audio_port):
             print(f"[CLIENT] Unexpected registration response: {response}")
             return False, None
 
-        join_ok, join_response = send_control_command(server_ip, f"JOIN:{client_id}:{DEFAULT_ROOM}")
-        if not join_ok or not join_response.startswith("OK"):
+        join_ok, multicast_addr, join_response = join_room(server_ip, client_id, DEFAULT_ROOM)
+        if not join_ok:
             print(f"[CLIENT] JOIN failed for client {client_id}: {join_response}")
             return False, None
-
-        multicast_addr = None
-        if ":" in join_response:
-            _, multicast_addr = join_response.split(":", 1)
 
         print(f"[CLIENT] Registration successful for client {client_id}")
         return True, multicast_addr
@@ -268,9 +781,6 @@ def main():
             faulthandler.enable(all_threads=True)
     except Exception:
         pass
-    print("=" * 50)
-    print("VOICE CHAT CLIENT STARTING")
-    print("=" * 50)
 
     app = QApplication(sys.argv)
 
@@ -305,16 +815,15 @@ def main():
     print("[CLIENT] Registering with server...")
     registered, multicast_addr = register_client_with_server(client_id, net.server_ip, audio_port)
     if not registered:
-        from PySide6.QtWidgets import QMessageBox
-
         msg = QMessageBox()
         msg.setIcon(QMessageBox.Critical)
         msg.setWindowTitle("Registration Failed")
         msg.setText(f"Client ID {client_id} is already in use or registration failed!")
         msg.setInformativeText("Please choose a different client ID and try again.")
         msg.exec()
-        audio.stop()
+        audio.shutdown()
         sys.exit(1)
+
     if multicast_addr:
         audio.join_multicast(multicast_addr.strip())
 
@@ -327,7 +836,7 @@ def main():
         sys.exit(app.exec())
     except Exception as e:
         print(f"[CLIENT] Failed to start main window: {e}")
-        audio.stop()
+        audio.shutdown()
         sys.exit(1)
 
 
