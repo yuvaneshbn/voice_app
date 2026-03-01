@@ -59,9 +59,24 @@ class AudioEngine:
         self.input = None
         self.send_sock = None
         self.send_thread = None
+        self.server_ip = None
+
+        # Runtime audio controls (wired from UI)
+        self.master_volume = 1.0
+        self.output_volume = 1.0
+        self.tx_gain_db = 0.0
+        self.mic_sensitivity = 50
+        self.noise_suppression = 0
+        self.auto_gain = False
+        self.tx_muted = False
+        self.capture_level = 0
+        self.capture_active = False
+        self.input_device_index = None
+        self.output_device_index = None
 
         self.echo = None
         self.echo_enabled = False
+        self.echo_lock = threading.Lock()
         if echo_cancel_available():
             try:
                 self.echo = EchoCanceller(sample_rate=RATE, channels=1, frame_size=FRAME, delay_ms=60)
@@ -76,9 +91,26 @@ class AudioEngine:
         self.seq = 0
         self.timestamp = 0
         self.jitter_stats = {"missing": 0, "received": 0}
+        self.last_packet_seq = {}
 
         # ================= OUTPUT STREAM =================
-        self.output = self.audio.open(
+        self.output = None
+        self._open_output_stream()
+
+        self.listen_thread = threading.Thread(target=self.listen, daemon=True)
+        self.listen_thread.start()
+
+    # --------------------------------------------------
+
+    def _open_output_stream(self):
+        if self.output is not None:
+            try:
+                self.output.stop_stream()
+                self.output.close()
+            except Exception:
+                pass
+
+        kwargs = dict(
             format=pyaudio.paInt16,
             channels=1,
             rate=RATE,
@@ -86,10 +118,11 @@ class AudioEngine:
             frames_per_buffer=CHUNK,
             stream_callback=self._callback,
         )
-        self.output.start_stream()
+        if self.output_device_index is not None:
+            kwargs["output_device_index"] = self.output_device_index
 
-        self.listen_thread = threading.Thread(target=self.listen, daemon=True)
-        self.listen_thread.start()
+        self.output = self.audio.open(**kwargs)
+        self.output.start_stream()
 
     # --------------------------------------------------
 
@@ -111,13 +144,112 @@ class AudioEngine:
 
     # --------------------------------------------------
 
+    def list_input_devices(self):
+        devices = []
+        try:
+            for i in range(self.audio.get_device_count()):
+                info = self.audio.get_device_info_by_index(i)
+                if int(info.get("maxInputChannels", 0)) > 0:
+                    devices.append((i, info.get("name", f"Input {i}")))
+        except Exception:
+            pass
+        return devices
+
+    def list_output_devices(self):
+        devices = []
+        try:
+            for i in range(self.audio.get_device_count()):
+                info = self.audio.get_device_info_by_index(i)
+                if int(info.get("maxOutputChannels", 0)) > 0:
+                    devices.append((i, info.get("name", f"Output {i}")))
+        except Exception:
+            pass
+        return devices
+
+    def set_input_device(self, device_index):
+        self.input_device_index = device_index
+        if self.running and self.server_ip:
+            self.stop()
+            self.start(self.server_ip)
+        return True
+
+    def set_output_device(self, device_index):
+        self.output_device_index = device_index
+        try:
+            self._open_output_stream()
+            return True
+        except Exception as e:
+            print(f"[AUDIO] Failed to set output device {device_index}: {e}")
+            return False
+
+    def set_master_volume(self, value):
+        self.master_volume = max(0.0, min(2.0, float(value) / 100.0))
+
+    def set_output_volume(self, value):
+        self.output_volume = max(0.0, min(2.0, float(value) / 100.0))
+
+    def set_gain_db(self, value):
+        self.tx_gain_db = max(-20.0, min(20.0, float(value)))
+
+    def set_mic_sensitivity(self, value):
+        self.mic_sensitivity = max(0, min(100, int(value)))
+
+    def set_noise_suppression(self, value):
+        self.noise_suppression = max(0, min(100, int(value)))
+
+    def set_auto_gain(self, enabled):
+        self.auto_gain = bool(enabled)
+
+    def set_echo_enabled(self, enabled):
+        with self.echo_lock:
+            self.echo_enabled = bool(enabled) and self.echo is not None
+
+    def set_tx_muted(self, enabled):
+        self.tx_muted = bool(enabled)
+
+    def test_microphone_level(self, duration_sec=1.0):
+        duration_sec = max(0.2, float(duration_sec))
+        max_peak = 0
+        stream = None
+        try:
+            kwargs = dict(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK,
+            )
+            if self.input_device_index is not None:
+                kwargs["input_device_index"] = self.input_device_index
+            stream = self.audio.open(**kwargs)
+            deadline = time.time() + duration_sec
+            while time.time() < deadline:
+                pcm = stream.read(CHUNK, exception_on_overflow=False)
+                samples = struct.unpack("<" + "h" * CHUNK, pcm)
+                peak = max(abs(s) for s in samples) if samples else 0
+                max_peak = max(max_peak, peak)
+        except Exception as e:
+            print(f"[AUDIO] Mic test failed: {e}")
+        finally:
+            try:
+                if stream is not None:
+                    stream.stop_stream()
+                    stream.close()
+            except Exception:
+                pass
+        return min(100, int((max_peak * 100) / 32767)) if max_peak else 0
+
+    # --------------------------------------------------
+
     def _callback(self, in_data, frame_count, *_):
         frame_bytes = frame_count * 2
         mixed_pcm = self.mix(frame_bytes)
         self.last_playout = mixed_pcm
-        if self.echo_enabled and self.echo is not None:
+        if self.echo_enabled:
             try:
-                self.echo.process_reverse(mixed_pcm)
+                with self.echo_lock:
+                    if self.echo_enabled and self.echo is not None:
+                        self.echo.process_reverse(mixed_pcm)
             except Exception as e:
                 print(f"[AUDIO] Echo reverse error, disabling echo canceller: {e}")
                 self.echo_enabled = False
@@ -147,6 +279,15 @@ class AudioEngine:
                 while len(buf) > MAX_FRAMES:
                     buf.pop(min(buf.keys()))
 
+                # If source is inactive for a while, reset sequence tracking to avoid PLC spam.
+                last_arrival = self.last_arrival.get(sid)
+                if last_arrival is not None and (time.time() - last_arrival) > 0.8:
+                    buf.clear()
+                    self.expected_seq.pop(sid, None)
+                    self.playout_ts.pop(sid, None)
+                    self.stream_levels[sid] = 0.0
+                    continue
+
                 target = self.jitter_target.get(sid, TARGET_FRAMES)
                 if len(buf) < max(MIN_FRAMES, target):
                     continue
@@ -160,6 +301,15 @@ class AudioEngine:
                         continue
                     frames.append((sid, chunk, ts))
                 else:
+                    # Fast resync if we already have a nearby future packet.
+                    if buf:
+                        next_seq = min(buf.keys())
+                        gap = (next_seq - exp) & 0xFFFF
+                        if 0 < gap <= 6 and next_seq in buf:
+                            ts, chunk, _arr = buf.pop(next_seq)
+                            frames.append((sid, chunk, ts))
+                            self.expected_seq[sid] = (next_seq + 1) & 0xFFFF
+                            continue
                     self.jitter_stats["missing"] += 1
                     if self.jitter_stats["missing"] % 100 == 1:
                         print(f"[JITTER] Missing seq {exp} from {sid}")
@@ -202,7 +352,9 @@ class AudioEngine:
         def soft_clip(x):
             return int(32767 * math.tanh(x / 32767.0))
 
-        output_bytes = struct.pack("<" + "h" * len(samples), *[soft_clip(s) for s in samples])
+        volume_factor = max(0.0, min(2.0, self.master_volume * self.output_volume))
+        output_samples = [soft_clip(int(s * volume_factor)) for s in samples]
+        output_bytes = struct.pack("<" + "h" * len(output_samples), *output_samples)
 
         # Limit logging to avoid spam
         if not hasattr(self, "_mix_count"):
@@ -271,6 +423,17 @@ class AudioEngine:
                     exp_ts = self.playout_ts.get(sender_id)
                     if exp_ts is not None and ts < exp_ts:
                         return
+
+                    # Detect discontinuity/restart and resync receive tracking.
+                    prev_seq = self.last_packet_seq.get(sender_id)
+                    if prev_seq is not None:
+                        forward = (seq - prev_seq) & 0xFFFF
+                        if forward > 2000:
+                            self.expected_seq[sender_id] = seq
+                            self.playout_ts[sender_id] = ts
+                            buf.clear()
+                    self.last_packet_seq[sender_id] = seq
+
                     buf[seq] = (ts, pcm[:frame_bytes], arrival_time)
                     if sender_id not in self.expected_seq:
                         self.expected_seq[sender_id] = seq
@@ -380,15 +543,19 @@ class AudioEngine:
             return
 
         self.running = True
+        self.server_ip = server_ip
         print(f"[AUDIO] Audio capture ACTIVE for {self.client_id} -> {server_ip}:50002")
 
-        self.input = self.audio.open(
+        input_kwargs = dict(
             format=pyaudio.paInt16,
             channels=1,
             rate=RATE,
             input=True,
             frames_per_buffer=CHUNK,
         )
+        if self.input_device_index is not None:
+            input_kwargs["input_device_index"] = self.input_device_index
+        self.input = self.audio.open(**input_kwargs)
 
         self.send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.send_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
@@ -398,9 +565,37 @@ class AudioEngine:
             while self.running:
                 try:
                     pcm = self.input.read(CHUNK, exception_on_overflow=False)
-                    if self.echo_enabled and self.echo is not None:
+                    samples = list(struct.unpack("<" + "h" * CHUNK, pcm))
+                    input_peak = max(abs(s) for s in samples) if samples else 0
+
+                    # Capture telemetry for UI meters.
+                    self.capture_level = min(100, int((input_peak * 100) / 32767))
+                    activity_threshold = max(120, int(2200 - (self.mic_sensitivity * 16)))
+                    self.capture_active = input_peak >= activity_threshold and not self.tx_muted
+
+                    if self.tx_muted:
+                        samples = [0] * len(samples)
+                    else:
+                        # Noise suppression slider behaves like a simple gate.
+                        gate = int((self.noise_suppression / 100.0) * 2500)
+                        if gate > 0:
+                            samples = [s if abs(s) >= gate else 0 for s in samples]
+
+                        gain = 10 ** (self.tx_gain_db / 20.0)
+                        gain *= 0.5 + (self.mic_sensitivity / 100.0)
+                        if self.auto_gain:
+                            target = 9000 + (self.mic_sensitivity * 80)
+                            gain *= max(0.5, min(3.0, target / max(input_peak, 1)))
+
+                        if gain != 1.0:
+                            samples = [max(-32768, min(32767, int(s * gain))) for s in samples]
+
+                    pcm = struct.pack("<" + "h" * len(samples), *samples)
+                    if self.echo_enabled:
                         try:
-                            pcm = self.echo.process_capture(pcm)
+                            with self.echo_lock:
+                                if self.echo_enabled and self.echo is not None:
+                                    pcm = self.echo.process_capture(pcm)
                         except Exception as e:
                             print(f"[AUDIO] Echo capture error, disabling echo canceller: {e}")
                             self.echo_enabled = False
@@ -432,6 +627,8 @@ class AudioEngine:
     def stop(self):
         # Stop capture only (keep receive/output alive)
         self.running = False
+        self.capture_active = False
+        self.capture_level = 0
         if self.send_thread and self.send_thread.is_alive():
             self.send_thread.join(timeout=1.0)
 
@@ -452,15 +649,16 @@ class AudioEngine:
 
     def shutdown(self):
         # Full shutdown (called on app exit)
-        self.running = False
+        self.stop()
         self.listen_running = False
         self.leave_multicast()
-        if self.echo is not None:
-            try:
-                self.echo.close()
-            except Exception:
-                pass
-            self.echo = None
+        with self.echo_lock:
+            if self.echo is not None:
+                try:
+                    self.echo.close()
+                except Exception:
+                    pass
+                self.echo = None
             self.echo_enabled = False
 
         try:
@@ -469,8 +667,9 @@ class AudioEngine:
             pass
 
         try:
-            self.output.stop_stream()
-            self.output.close()
+            if self.output is not None:
+                self.output.stop_stream()
+                self.output.close()
         except Exception:
             pass
 

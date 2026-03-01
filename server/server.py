@@ -83,7 +83,12 @@ class VoiceServer:
                     logging.info("%s registered from %s:%s", client_id, peer_ip, audio_port)
 
             elif cmd == "LIST":
-                response = (",".join(sorted(self.clients.keys())) + "\n").encode()
+                if client_id in self.clients:
+                    room_id = self.clients[client_id].room
+                    room_clients = self.rooms.get(room_id, set()) if room_id else set()
+                    response = (",".join(sorted(room_clients)) + "\n").encode()
+                else:
+                    response = (",".join(sorted(self.clients.keys())) + "\n").encode()
 
             elif cmd == "PING" and client_id in self.clients:
                 self.clients[client_id].last_heartbeat = time.time()
