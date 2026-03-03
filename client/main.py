@@ -55,6 +55,14 @@ def _sort_client_ids(client_id):
     return (1, str(client_id))
 
 
+def _parse_client_list_response(response):
+    if not response:
+        return []
+    if "\n" in response:
+        return [cid.strip() for cid in response.splitlines() if cid.strip()]
+    return [cid.strip() for cid in response.split(",") if cid.strip()]
+
+
 def load_ui_widget(ui_path, parent=None):
     loader = QUiLoader()
     ui_file = QFile(ui_path)
@@ -67,6 +75,23 @@ def load_ui_widget(ui_path, parent=None):
     if widget is None:
         raise RuntimeError(f"Unable to load UI file: {ui_path}")
     return widget
+
+
+def require_child(parent, widget_type, object_name):
+    widget = parent.findChild(widget_type, object_name)
+    if widget is None:
+        raise RuntimeError(
+            f"Missing required widget '{object_name}' in UI loaded into {type(parent).__name__}"
+        )
+    return widget
+
+
+def find_first_child(parent, widget_type, *object_names):
+    for name in object_names:
+        widget = parent.findChild(widget_type, name)
+        if widget is not None:
+            return widget
+    return None
 
 
 def _set_socket_dscp(sock, ip_tos):
@@ -110,18 +135,15 @@ class VolumeControlPanel:
         self.audio = audio
         self.widget = load_ui_widget(VOLUME_CONTROL_UI, parent)
 
-        self.master_slider = self.widget.findChild(QSlider, "masterSlider")
-        self.gain_slider = self.widget.findChild(QSlider, "gainSlider")
-        self.output_slider = self.widget.findChild(QSlider, "outputSlider")
-        self.mic_sensitivity_slider = self.widget.findChild(QSlider, "micSensitivitySlider")
-        self.noise_suppression_label = self.widget.findChild(QLabel, "noiseSuppressionLabel")
-        self.noise_suppression_slider = self.widget.findChild(QSlider, "noiseSuppressionSlider")
-        self.noise_suppression_enable_checkbox = self.widget.findChild(QCheckBox, "noiseSuppressionEnableCheckbox")
-        self.auto_gain_checkbox = self.widget.findChild(QCheckBox, "autoGainCheckbox")
-        self.echo_checkbox = self.widget.findChild(QCheckBox, "echoCheckbox")
-        self.test_mic_button = self.widget.findChild(QPushButton, "testMicButton")
-        self.test_status_label = self.widget.findChild(QLabel, "testStatusLabel")
-        self.mic_level_bar = self.widget.findChild(QProgressBar, "micLevelBar")
+        self.master_slider = require_child(self.widget, QSlider, "masterSlider")
+        self.gain_slider = require_child(self.widget, QSlider, "gainSlider")
+        self.noise_suppression_label = require_child(self.widget, QLabel, "noiseSuppressionLabel")
+        self.noise_suppression_slider = require_child(self.widget, QSlider, "noiseSuppressionSlider")
+        self.noise_suppression_enable_checkbox = require_child(self.widget, QCheckBox, "noiseSuppressionEnableCheckbox")
+        self.echo_checkbox = require_child(self.widget, QCheckBox, "echoCheckbox")
+        self.test_mic_button = require_child(self.widget, QPushButton, "testMicButton")
+        self.test_status_label = require_child(self.widget, QLabel, "testStatusLabel")
+        self.mic_level_bar = require_child(self.widget, QProgressBar, "micLevelBar")
 
         self._configure_controls()
         self._wire_signals()
@@ -129,70 +151,36 @@ class VolumeControlPanel:
     def _configure_controls(self):
         for slider, default_value in (
             (self.master_slider, int(self.audio.master_volume * 100)),
-            (self.output_slider, int(self.audio.output_volume * 100)),
-            (self.mic_sensitivity_slider, int(self.audio.mic_sensitivity)),
             (self.noise_suppression_slider, int(self.audio.noise_suppression)),
         ):
-            if slider is not None:
-                slider.setMinimum(0)
-                slider.setMaximum(100)
-                slider.setValue(default_value)
+            slider.setMinimum(0)
+            slider.setMaximum(100)
+            slider.setValue(default_value)
 
-        if self.gain_slider is not None:
-            self.gain_slider.setValue(int(self.audio.tx_gain_db))
-
-        if self.auto_gain_checkbox is not None:
-            self.auto_gain_checkbox.setChecked(self.audio.auto_gain)
-
-        if self.noise_suppression_enable_checkbox is not None:
-            self.noise_suppression_enable_checkbox.setChecked(self.audio.noise_suppression_enabled)
+        self.gain_slider.setValue(int(self.audio.tx_gain_db))
+        self.noise_suppression_enable_checkbox.setChecked(self.audio.noise_suppression_enabled)
         self._sync_noise_suppression_controls()
-
-        if self.echo_checkbox is not None:
-            self.echo_checkbox.setChecked(self.audio.echo_enabled)
-            self.echo_checkbox.setEnabled(self.audio.echo is not None)
-
-        if self.mic_level_bar is not None:
-            self.mic_level_bar.setMinimum(0)
-            self.mic_level_bar.setMaximum(100)
-            self.mic_level_bar.setValue(0)
+        self.echo_checkbox.setChecked(self.audio.echo_enabled)
+        self.echo_checkbox.setEnabled(self.audio.echo is not None)
+        self.mic_level_bar.setMinimum(0)
+        self.mic_level_bar.setMaximum(100)
+        self.mic_level_bar.setValue(0)
 
     def _wire_signals(self):
-        if self.master_slider is not None:
-            self.master_slider.valueChanged.connect(self.audio.set_master_volume)
-
-        if self.output_slider is not None:
-            self.output_slider.valueChanged.connect(self.audio.set_output_volume)
-
-        if self.gain_slider is not None:
-            self.gain_slider.valueChanged.connect(self.audio.set_gain_db)
-
-        if self.mic_sensitivity_slider is not None:
-            self.mic_sensitivity_slider.valueChanged.connect(self.audio.set_mic_sensitivity)
-
-        if self.noise_suppression_slider is not None:
-            self.noise_suppression_slider.valueChanged.connect(self.audio.set_noise_suppression)
-        if self.noise_suppression_enable_checkbox is not None:
-            self.noise_suppression_enable_checkbox.toggled.connect(self._on_noise_suppression_toggled)
-
-        if self.auto_gain_checkbox is not None:
-            self.auto_gain_checkbox.toggled.connect(self.audio.set_auto_gain)
-
-        if self.echo_checkbox is not None:
-            self.echo_checkbox.toggled.connect(self.audio.set_echo_enabled)
-
-        if self.test_mic_button is not None:
-            self.test_mic_button.clicked.connect(self._test_microphone)
+        self.master_slider.valueChanged.connect(self.audio.set_master_volume)
+        self.gain_slider.valueChanged.connect(self.audio.set_gain_db)
+        self.noise_suppression_slider.valueChanged.connect(self.audio.set_noise_suppression)
+        self.noise_suppression_enable_checkbox.toggled.connect(self._on_noise_suppression_toggled)
+        self.echo_checkbox.toggled.connect(self.audio.set_echo_enabled)
+        self.test_mic_button.clicked.connect(self._test_microphone)
 
     def _test_microphone(self):
         level = self.audio.test_microphone_level(0.8)
         self.set_mic_level(level)
-        if self.test_status_label is not None:
-            self.test_status_label.setText(f"Mic level: {level}%")
+        self.test_status_label.setText(f"Mic level: {level}%")
 
     def set_mic_level(self, level):
-        if self.mic_level_bar is not None:
-            self.mic_level_bar.setValue(max(0, min(100, int(level))))
+        self.mic_level_bar.setValue(max(0, min(100, int(level))))
 
     def _sync_noise_suppression_controls(self):
         enabled = bool(self.audio.noise_suppression_enabled)
@@ -212,11 +200,18 @@ class ParticipantRow:
         self.is_self = is_self
         self.widget = load_ui_widget(PARTICIPANT_ITEM_UI, parent)
 
-        self.name_label = self.widget.findChild(QLabel, "participantName")
-        self.talk_checkbox = self.widget.findChild(QCheckBox, "talkCheckbox")
-        self.mute_checkbox = self.widget.findChild(QCheckBox, "hearCheckbox")
-        self.mic_status_label = self.widget.findChild(QLabel, "micStatusLabel")
-        self.volume_bar = self.widget.findChild(QProgressBar, "participantVolumeBar")
+        self.name_label = require_child(self.widget, QLabel, "participantName")
+        self.talk_checkbox = require_child(self.widget, QCheckBox, "talkCheckbox")
+        self.mute_checkbox = find_first_child(
+            self.widget,
+            QCheckBox,
+            "muteCheckbox",
+            "hearCheckbox",  # legacy UI object name
+        )
+        if self.mute_checkbox is None:
+            raise RuntimeError("Missing required participant mute checkbox (muteCheckbox/hearCheckbox)")
+        self.mic_status_label = require_child(self.widget, QLabel, "micStatusLabel")
+        self.volume_bar = require_child(self.widget, QProgressBar, "participantVolumeBar")
 
         name_text = f"Client {self.client_id}"
         if self.is_self:
@@ -263,6 +258,7 @@ class SettingsDialog(QDialog):
         self.audio = audio
         self.server_ip = server_ip
         self.reconnect_cb = reconnect_cb
+        self._populating_devices = False
 
         self.form = load_ui_widget(SETTINGS_DIALOG_UI, self)
         layout = QVBoxLayout(self)
@@ -273,14 +269,18 @@ class SettingsDialog(QDialog):
         if os.path.exists(APP_ICON_PATH):
             self.setWindowIcon(QIcon(APP_ICON_PATH))
 
-        self.input_device_combo = self.form.findChild(QComboBox, "inputDeviceCombo")
-        self.output_device_combo = self.form.findChild(QComboBox, "outputDeviceCombo")
-        self.server_ip_value = self.form.findChild(QLabel, "serverIpValue")
-        self.reconnect_button = self.form.findChild(QPushButton, "reconnectButton")
-        self.save_close_button = self.form.findChild(QPushButton, "saveCloseButton")
-        self.cancel_button = self.form.findChild(QPushButton, "cancelButton")
+        self.input_device_combo = require_child(self.form, QComboBox, "inputDeviceCombo")
+        self.output_device_combo = require_child(self.form, QComboBox, "outputDeviceCombo")
+        self.server_ip_value = require_child(self.form, QLabel, "serverIpValue")
+        self.reconnect_button = require_child(self.form, QPushButton, "reconnectButton")
+        self.save_close_button = require_child(self.form, QPushButton, "saveCloseButton")
+        self.cancel_button = require_child(self.form, QPushButton, "cancelButton")
 
         self.advanced_audio_layout = self.form.findChild(QVBoxLayout, "advancedAudioLayout")
+        if self.advanced_audio_layout is None:
+            advanced_group = self.form.findChild(QWidget, "advancedAudioGroup")
+            if advanced_group is not None:
+                self.advanced_audio_layout = advanced_group.layout()
         self.volume_hint = self.form.findChild(QLabel, "volumeControlHint")
 
         self.volume_controls = VolumeControlPanel(self.audio, self.form)
@@ -289,16 +289,23 @@ class SettingsDialog(QDialog):
         if self.advanced_audio_layout is not None:
             self.advanced_audio_layout.addWidget(self.volume_controls.widget)
 
-        if self.server_ip_value is not None:
-            self.server_ip_value.setText(self.server_ip)
+        self.server_ip_value.setText(self.server_ip)
 
         self._populate_devices()
 
+        self.input_device_combo.currentIndexChanged.connect(self._on_input_device_changed)
+        self.output_device_combo.currentIndexChanged.connect(self._on_output_device_changed)
         self.reconnect_button.clicked.connect(self._reconnect)
         self.save_close_button.clicked.connect(self._save_and_close)
         self.cancel_button.clicked.connect(self.reject)
 
     def _populate_devices(self):
+        self._populating_devices = True
+        self.input_device_combo.blockSignals(True)
+        self.output_device_combo.blockSignals(True)
+        self.input_device_combo.clear()
+        self.output_device_combo.clear()
+
         input_devices = self.audio.list_input_devices()
         output_devices = self.audio.list_output_devices()
 
@@ -318,6 +325,10 @@ class SettingsDialog(QDialog):
             if pos >= 0:
                 self.output_device_combo.setCurrentIndex(pos)
 
+        self.input_device_combo.blockSignals(False)
+        self.output_device_combo.blockSignals(False)
+        self._populating_devices = False
+
     def _reconnect(self):
         ok, message = self.reconnect_cb()
         box = QMessageBox(self)
@@ -335,16 +346,23 @@ class SettingsDialog(QDialog):
         box.exec()
 
     def _save_and_close(self):
-        input_device = self.input_device_combo.currentData()
-        output_device = self.output_device_combo.currentData()
+        self._on_input_device_changed()
+        self._on_output_device_changed()
+        self.accept()
 
+    def _on_input_device_changed(self):
+        if self._populating_devices:
+            return
+        input_device = self.input_device_combo.currentData()
         if input_device is not None:
             self.audio.set_input_device(input_device)
 
+    def _on_output_device_changed(self):
+        if self._populating_devices:
+            return
+        output_device = self.output_device_combo.currentData()
         if output_device is not None:
             self.audio.set_output_device(output_device)
-
-        self.accept()
 
 
 class MainWindow(QMainWindow):
@@ -378,28 +396,34 @@ class MainWindow(QMainWindow):
         if os.path.exists(APP_ICON_PATH):
             self.setWindowIcon(QIcon(APP_ICON_PATH))
 
-        self.room_combo = root.findChild(QComboBox, "roomCombo")
-        self.join_leave_button = root.findChild(QPushButton, "joinLeaveButton")
-        self.refresh_button = root.findChild(QPushButton, "refreshButton")
-        self.connection_indicator = root.findChild(QLabel, "connectionIndicator")
+        self.room_combo = require_child(root, QComboBox, "roomCombo")
+        self.join_leave_button = require_child(root, QPushButton, "joinLeaveButton")
+        self.refresh_button = require_child(root, QPushButton, "refreshButton")
+        self.connection_indicator = require_child(root, QLabel, "connectionIndicator")
 
-        self.search_input = root.findChild(QLineEdit, "searchInput")
-        self.participant_list = root.findChild(QListWidget, "participantList")
-        self.count_label = root.findChild(QLabel, "countLabel")
+        self.search_input = require_child(root, QLineEdit, "searchInput")
+        self.participant_list = require_child(root, QListWidget, "participantList")
+        self.count_label = require_child(root, QLabel, "countLabel")
 
-        self.active_speakers_label = root.findChild(QLabel, "activeSpeakersLabel")
-        self.speaker_log_list = root.findChild(QListWidget, "speakerLogList")
-        self.system_level_bar = root.findChild(QProgressBar, "systemLevelBar")
+        self.active_speakers_label = require_child(root, QLabel, "activeSpeakersLabel")
+        self.speaker_log_list = require_child(root, QListWidget, "speakerLogList")
+        self.system_level_bar = require_child(root, QProgressBar, "systemLevelBar")
 
         self.controls_layout = root.findChild(QVBoxLayout, "controlsPlaceholderLayout")
+        if self.controls_layout is None:
+            controls_group = root.findChild(QWidget, "myControlsGroup")
+            if controls_group is not None:
+                self.controls_layout = controls_group.layout()
+        if self.controls_layout is None:
+            raise RuntimeError("Missing required controls layout: controlsPlaceholderLayout")
         self.controls_hint = root.findChild(QLabel, "controlsHint")
 
-        self.mute_button = root.findChild(QPushButton, "muteButton")
-        self.broadcast_button = root.findChild(QPushButton, "broadcastButton")
-        self.settings_button = root.findChild(QPushButton, "settingsButton")
+        self.mute_button = require_child(root, QPushButton, "muteButton")
+        self.broadcast_button = require_child(root, QPushButton, "broadcastButton")
+        self.settings_button = require_child(root, QPushButton, "settingsButton")
 
-        self.warning_label = root.findChild(QLabel, "warningLabel")
-        self.main_status_bar = root.findChild(QStatusBar, "mainStatusBar")
+        self.warning_label = require_child(root, QLabel, "warningLabel")
+        self.main_status_bar = require_child(root, QStatusBar, "mainStatusBar")
 
         self.volume_controls = VolumeControlPanel(self.audio, root)
         if self.controls_hint is not None:
@@ -472,7 +496,7 @@ class MainWindow(QMainWindow):
         if not ok:
             return None, response
 
-        participants = [cid.strip() for cid in response.split(",") if cid.strip()]
+        participants = _parse_client_list_response(response)
         if self.my_id not in participants:
             participants.append(self.my_id)
 
@@ -514,6 +538,7 @@ class MainWindow(QMainWindow):
             self.participant_rows[cid] = row
 
         self._recompute_hear_targets()
+        self.update_hear_targets()
         self._sync_broadcast_button()
         self.apply_search_filter()
 
@@ -538,6 +563,14 @@ class MainWindow(QMainWindow):
         participants = set(self.participant_rows.keys())
         self.hear_targets = {cid for cid in participants if cid != self.my_id and cid not in self.muted_participants}
 
+    def update_hear_targets(self):
+        hear = ",".join(sorted(self.hear_targets, key=_sort_client_ids))
+        ok, response = send_control_command(self.server_ip, f"HEAR:{self.my_id}:{hear}")
+        if ok and response == "OK":
+            self._set_connected_state(True)
+        else:
+            self._set_connected_state(False, f"Failed to update hear targets: {response}")
+
     def on_talk_toggled(self, client_id, enabled):
         if client_id == self.my_id:
             return
@@ -559,6 +592,7 @@ class MainWindow(QMainWindow):
             self.muted_participants.discard(client_id)
 
         self._recompute_hear_targets()
+        self.update_hear_targets()
 
     def update_targets(self):
         if self.targets and not self.audio.running:

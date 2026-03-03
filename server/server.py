@@ -1,30 +1,31 @@
 import asyncio
 import hashlib
 import logging
-import os
 import queue
 import socket
-import subprocess
+import struct
 import threading
 import time
 from collections import defaultdict
 
 from opus_codec import OpusCodec
-from room_mixer import PersonalizedMixer
 
 DISCOVERY_PORT = 50000
 CONTROL_PORT = 50001
 AUDIO_PORT = 50002
 DEFAULT_ROOM = "main"
 MULTICAST_BASE = "239.0.0."
-CLIENT_TIMEOUT_SEC = 30
+CLIENT_TIMEOUT_SEC = 35
 SERVER_SECRET = "mysecret"
 DSCP_EF = 46
 DSCP_CS3 = 24
 IP_TOS_EF = DSCP_EF << 2
 IP_TOS_CS3 = DSCP_CS3 << 2
-DECODE_WORKERS = 2
-DECODE_QUEUE_MAX = 8192
+MIX_FRAME_SAMPLES = 320
+MIX_FRAME_BYTES = MIX_FRAME_SAMPLES * 2
+ROOM_SOURCE_STALE_SEC = 0.25
+ROOM_MIX_QUEUE_MAX = 128
+VAD_PEAK_THRESHOLD = 120
 
 
 def _set_socket_dscp(sock, ip_tos):
@@ -34,143 +35,164 @@ def _set_socket_dscp(sock, ip_tos):
         pass
 
 
-def _find_port_owners_windows(port, protocol):
-    owners = []
-    try:
-        result = subprocess.run(
-            ["netstat", "-aon", "-p", protocol],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-    except Exception:
-        return owners
-
-    target = f":{port}"
-    for raw_line in result.stdout.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        if parts[0].upper() != protocol.upper():
-            continue
-        local_addr = parts[1]
-        if not local_addr.endswith(target):
-            continue
-        try:
-            pid = int(parts[-1])
-        except ValueError:
-            continue
-        owners.append(pid)
-    return sorted(set(owners))
-
-
-def _get_process_cmdline_windows(pid):
-    try:
-        result = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f'(Get-CimInstance Win32_Process -Filter "ProcessId = {pid}").CommandLine',
-            ],
-            capture_output=True,
-            text=True,
-            timeout=3,
-            check=False,
-        )
-    except Exception:
-        return ""
-    return (result.stdout or "").strip()
-
-
-def _kill_process_windows(pid):
-    try:
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except Exception:
-        pass
-
-
 class Client:
     def __init__(self, client_id, ip, audio_port):
         self.client_id = client_id
         self.addr = (ip, audio_port)
         self.room = None
         self.targets = set()
+        self.hear_targets = None  # None means allow all speakers in room.
         self.last_heartbeat = time.time()
+
+
+class RoomMixer:
+    """One mixer thread per room with a bounded output packet queue."""
+
+    def __init__(self, room_id):
+        self.room_id = room_id
+        self.sources = {}
+        self.last_seen = {}
+        self.lock = threading.Lock()
+        self.seq = 0
+        self.running = True
+        self.encoder = OpusCodec(
+            rate=16000,
+            channels=1,
+            frame_size=MIX_FRAME_SAMPLES,
+            bitrate=48000,
+            create_encoder=True,
+            create_decoder=False,
+        )
+        self.mixed_queue = queue.Queue(maxsize=ROOM_MIX_QUEUE_MAX)
+        self._thread = threading.Thread(
+            target=self._mix_loop,
+            daemon=True,
+            name=f"room-mix-{room_id}",
+        )
+        self._thread.start()
+
+    def add_pcm(self, sender_id, pcm_bytes):
+        if not pcm_bytes:
+            return
+        pcm = (pcm_bytes + (b"\x00" * MIX_FRAME_BYTES))[:MIX_FRAME_BYTES]
+        if max(abs(sample) for sample in struct.unpack("<320h", pcm)) < VAD_PEAK_THRESHOLD:
+            with self.lock:
+                self.sources.pop(sender_id, None)
+                self.last_seen.pop(sender_id, None)
+            return
+        now = time.time()
+        with self.lock:
+            self.sources[sender_id] = pcm
+            self.last_seen[sender_id] = now
+
+    def remove_source(self, sender_id):
+        with self.lock:
+            self.sources.pop(sender_id, None)
+            self.last_seen.pop(sender_id, None)
+
+    def _collect_frames_locked(self):
+        now = time.time()
+        stale = [
+            sender_id
+            for sender_id, last_seen in self.last_seen.items()
+            if (now - last_seen) > ROOM_SOURCE_STALE_SEC
+        ]
+        for sender_id in stale:
+            self.sources.pop(sender_id, None)
+            self.last_seen.pop(sender_id, None)
+
+        return list(self.sources.items())
+
+    @staticmethod
+    def _mix_pcm_frames(frames):
+        mixed = [0] * MIX_FRAME_SAMPLES
+        for frame in frames:
+            pcm = (frame + (b"\x00" * MIX_FRAME_BYTES))[:MIX_FRAME_BYTES]
+            samples = struct.unpack("<320h", pcm)
+            for idx, sample in enumerate(samples):
+                mixed[idx] += sample
+
+        active = len(frames)
+        if active <= 1:
+            gain = 1.0
+        elif active == 2:
+            gain = 0.95
+        else:
+            gain = 2.5 / float(active)
+
+        scaled = [int(sample * gain) for sample in mixed]
+        clamped = [max(-32768, min(32767, sample)) for sample in scaled]
+        return struct.pack("<320h", *clamped)
+
+    def _enqueue_packet(self, opus_payload, active_sender_ids):
+        packet = f"MIXED|{self.seq}|".encode("ascii") + opus_payload
+        self.seq = (self.seq + 1) & 0xFFFF
+        try:
+            self.mixed_queue.put_nowait((packet, tuple(active_sender_ids)))
+        except queue.Full:
+            try:
+                self.mixed_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.mixed_queue.put_nowait((packet, tuple(active_sender_ids)))
+            except queue.Full:
+                pass
+
+    def _mix_loop(self):
+        frame_period = 0.020
+        while self.running:
+            start = time.perf_counter()
+            with self.lock:
+                source_items = self._collect_frames_locked()
+
+            if source_items:
+                active_sender_ids = [sender_id for sender_id, _pcm in source_items]
+                frames = [pcm for _sender_id, pcm in source_items]
+                mixed_pcm = self._mix_pcm_frames(frames)
+                try:
+                    opus = self.encoder.encode(mixed_pcm)
+                except Exception:
+                    opus = b""
+                if opus:
+                    self._enqueue_packet(opus, active_sender_ids)
+
+            elapsed = time.perf_counter() - start
+            time.sleep(max(0.0, frame_period - elapsed))
+
+    def drain_packets(self, limit=64):
+        packets = []
+        for _ in range(limit):
+            try:
+                packets.append(self.mixed_queue.get_nowait())
+            except queue.Empty:
+                break
+        return packets
+
+    def stop(self):
+        self.running = False
+        if self._thread.is_alive():
+            self._thread.join(timeout=0.8)
 
 
 class VoiceServer:
     def __init__(self):
         self.clients = {}
         self.rooms = defaultdict(set)
-        self.personal_mixers = {}
+        self.room_mixers = {}
+        self.sender_decoders = {}
 
         self.packet_count = defaultdict(int)
         self.malformed_count = 0
         self.loop = None
         self.udp_sock = None
+        self.control_server = None
+        self.tasks = []
+        self.discovery_thread = None
+        self.running = False
+        self._shutdown_done = False
 
         self.state_lock = threading.RLock()
-        self.decode_queue = queue.Queue(maxsize=DECODE_QUEUE_MAX)
-        self.decode_workers = []
-        self.running = False
-
-    def _cleanup_stale_self_processes(self):
-        if os.name != "nt":
-            return
-
-        current_pid = os.getpid()
-
-        for protocol, port in (("TCP", CONTROL_PORT), ("UDP", AUDIO_PORT)):
-            owners = _find_port_owners_windows(port, protocol)
-            for pid in owners:
-                if pid == current_pid:
-                    continue
-                cmdline = _get_process_cmdline_windows(pid).lower()
-                if ("server.py" in cmdline) or cmdline.endswith("server.exe"):
-                    logging.warning(
-                        "Stopping stale server process pid=%s holding %s/%s",
-                        pid,
-                        protocol,
-                        port,
-                    )
-                    _kill_process_windows(pid)
-
-        # Give Windows a moment to release sockets after taskkill.
-        time.sleep(0.3)
-
-    def _raise_if_ports_busy(self):
-        if os.name != "nt":
-            return
-
-        blockers = []
-        current_pid = os.getpid()
-        for protocol, port in (("TCP", CONTROL_PORT), ("UDP", AUDIO_PORT)):
-            owners = [pid for pid in _find_port_owners_windows(port, protocol) if pid != current_pid]
-            if not owners:
-                continue
-            details = []
-            for pid in owners:
-                cmdline = _get_process_cmdline_windows(pid)
-                details.append(f"pid={pid} cmd={cmdline or 'unknown'}")
-            blockers.append(f"{protocol}/{port}: " + "; ".join(details))
-
-        if blockers:
-            joined = " | ".join(blockers)
-            raise RuntimeError(
-                f"Required ports are busy ({joined}). "
-                "Close the owning process and retry."
-            )
 
     @staticmethod
     def get_multicast_addr(room_id):
@@ -186,16 +208,90 @@ class VoiceServer:
             return parts[3] == SERVER_SECRET
         return False
 
+    @staticmethod
+    def _is_valid_client_id(client_id):
+        cid = (client_id or "").strip()
+        if not cid:
+            return False
+        if any(ch in cid for ch in (":", "|", "\n", "\r", "\t")):
+            return False
+        # Comma is reserved by legacy TARGETS csv parsing.
+        if "," in cid:
+            return False
+        return True
+
+    @staticmethod
+    def _normalize_client_id(client_id):
+        return (client_id or "").strip().rstrip(",")
+
+    def _resolve_targets_locked(self, sender_id, targets_str):
+        sender = self.clients.get(sender_id)
+        if sender is None or not sender.room:
+            return set()
+
+        room_members = self.rooms.get(sender.room, set())
+        normalized_members = defaultdict(list)
+        for member in room_members:
+            normalized_members[self._normalize_client_id(member)].append(member)
+
+        resolved = set()
+        raw_targets = [target.strip() for target in (targets_str or "").split(",") if target.strip()]
+        for target in raw_targets:
+            if target in room_members and target != sender_id:
+                resolved.add(target)
+                continue
+
+            norm = self._normalize_client_id(target)
+            matches = [member for member in normalized_members.get(norm, []) if member != sender_id]
+            if len(matches) == 1:
+                resolved.add(matches[0])
+        return resolved
+
+    def _collect_stale_client_ids_locked(self, now):
+        return [
+            cid
+            for cid, client in self.clients.items()
+            if (now - client.last_heartbeat) > CLIENT_TIMEOUT_SEC
+        ]
+
+    def _prune_stale_clients_now(self):
+        with self.state_lock:
+            stale = self._collect_stale_client_ids_locked(time.time())
+        for client_id in stale:
+            self.remove_client(client_id)
+
+    def _touch_client_locked(self, client_id):
+        client = self.clients.get(client_id)
+        if client is not None:
+            client.last_heartbeat = time.time()
+
+    def get_or_create_mixer(self, room_id):
+        with self.state_lock:
+            mixer = self.room_mixers.get(room_id)
+            if mixer is None:
+                mixer = RoomMixer(room_id)
+                self.room_mixers[room_id] = mixer
+            return mixer
+
     def broadcast_server(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         _set_socket_dscp(sock, IP_TOS_CS3)
-        while True:
+        try:
+            while self.running:
+                try:
+                    sock.sendto(b"VOICE_SERVER", ("<broadcast>", DISCOVERY_PORT))
+                except OSError as err:
+                    logging.debug("Discovery broadcast error: %s", err)
+                for _ in range(20):
+                    if not self.running:
+                        break
+                    time.sleep(0.1)
+        finally:
             try:
-                sock.sendto(b"VOICE_SERVER", ("<broadcast>", DISCOVERY_PORT))
-            except OSError as err:
-                logging.error("Discovery broadcast error: %s", err)
-            time.sleep(2)
+                sock.close()
+            except OSError:
+                pass
 
     async def handle_control(self, reader, writer):
         peer = writer.get_extra_info("peername")
@@ -210,41 +306,51 @@ class VoiceServer:
             except OSError:
                 pass
 
+        self._prune_stale_clients_now()
+
         try:
             raw = await reader.readline()
             message = raw.decode(errors="ignore").strip()
             parts = message.split(":")
             cmd = parts[0] if parts else ""
-            client_id = parts[1] if len(parts) > 1 else ""
+            client_id = parts[1].strip() if len(parts) > 1 else ""
 
             if cmd == "REGISTER" and self._validate_register(parts):
-                audio_port = int(parts[2])
-                with self.state_lock:
-                    taken = client_id in self.clients
-                    if not taken:
-                        self.clients[client_id] = Client(client_id, peer_ip, audio_port)
-                if taken:
-                    response = b"TAKEN\n"
-                    logging.warning("Client %s already in use", client_id)
+                if len(parts) < 3 or not client_id or not self._is_valid_client_id(client_id):
+                    response = b"ERR\n"
                 else:
-                    self.join_room(client_id, DEFAULT_ROOM)
-                    response = b"OK\n"
-                    logging.info("%s registered from %s:%s", client_id, peer_ip, audio_port)
+                    try:
+                        audio_port = int(parts[2])
+                    except ValueError:
+                        audio_port = 0
+
+                    if audio_port <= 0:
+                        response = b"ERR\n"
+                    else:
+                        with self.state_lock:
+                            taken = client_id in self.clients
+                            if not taken:
+                                self.clients[client_id] = Client(client_id, peer_ip, audio_port)
+                        if taken:
+                            response = b"TAKEN\n"
+                            logging.warning("Client %s already in use", client_id)
+                        else:
+                            response = b"OK\n"
+                            logging.info("%s registered from %s:%s", client_id, peer_ip, audio_port)
 
             elif cmd == "LIST":
                 with self.state_lock:
-                    if client_id in self.clients:
+                    if client_id and client_id in self.clients:
                         room_id = self.clients[client_id].room
                         room_clients = self.rooms.get(room_id, set()) if room_id else set()
-                        response = (",".join(sorted(room_clients)) + "\n").encode()
+                        response = ("\n".join(sorted(room_clients)) + "\n").encode()
                     else:
-                        response = (",".join(sorted(self.clients.keys())) + "\n").encode()
+                        response = ("\n".join(sorted(self.clients.keys())) + "\n").encode()
 
             elif cmd == "PING":
                 with self.state_lock:
-                    client = self.clients.get(client_id)
-                    if client:
-                        client.last_heartbeat = time.time()
+                    if client_id in self.clients:
+                        self._touch_client_locked(client_id)
                         response = b"OK\n"
 
             elif cmd == "JOIN" and len(parts) == 3:
@@ -261,9 +367,18 @@ class VoiceServer:
                     client = self.clients.get(client_id)
                     if client:
                         targets_str = parts[2] if len(parts) > 2 else ""
-                        client.targets = {target for target in targets_str.split(",") if target}
+                        client.targets = self._resolve_targets_locked(client_id, targets_str)
+                        self._touch_client_locked(client_id)
                         response = b"OK\n"
-                        logging.info("%s targets updated: %s", client_id, sorted(client.targets))
+
+            elif cmd == "HEAR":
+                with self.state_lock:
+                    client = self.clients.get(client_id)
+                    if client:
+                        hear_str = parts[2] if len(parts) > 2 else ""
+                        client.hear_targets = self._resolve_targets_locked(client_id, hear_str)
+                        self._touch_client_locked(client_id)
+                        response = b"OK\n"
 
             elif cmd == "UNREGISTER":
                 with self.state_lock:
@@ -275,8 +390,11 @@ class VoiceServer:
         except Exception as err:
             logging.exception("Control error from %s: %s", peer_ip, err)
 
-        writer.write(response)
-        await writer.drain()
+        try:
+            writer.write(response)
+            await writer.drain()
+        except Exception:
+            pass
         writer.close()
         await writer.wait_closed()
 
@@ -286,158 +404,106 @@ class VoiceServer:
             if client is None:
                 return
             old_room = client.room
+            if old_room == room_id and client_id in self.rooms.get(room_id, set()):
+                client.last_heartbeat = time.time()
+                self.get_or_create_mixer(room_id)
+                return
             if old_room and old_room != room_id:
                 self.rooms[old_room].discard(client_id)
                 if not self.rooms[old_room]:
                     self.rooms.pop(old_room, None)
+                    stale_mixer = self.room_mixers.pop(old_room, None)
+                else:
+                    stale_mixer = None
+            else:
+                stale_mixer = None
             client.room = room_id
+            client.last_heartbeat = time.time()
             self.rooms[room_id].add(client_id)
+
+        if stale_mixer is not None:
+            stale_mixer.stop()
+        self.get_or_create_mixer(room_id)
         logging.info("%s joined room %s", client_id, room_id)
 
     def remove_client(self, client_id):
         mixer_to_stop = None
         with self.state_lock:
             client = self.clients.pop(client_id, None)
+            self.sender_decoders.pop(client_id, None)
             if client and client.room:
-                self.rooms[client.room].discard(client_id)
-                if not self.rooms[client.room]:
-                    self.rooms.pop(client.room, None)
-
-            mixer_to_stop = self.personal_mixers.pop(client_id, None)
-            for mixer in self.personal_mixers.values():
-                mixer.remove_source(client_id)
+                room_id = client.room
+                room_members = self.rooms.get(room_id)
+                if room_members is not None:
+                    room_members.discard(client_id)
+                    if not room_members:
+                        self.rooms.pop(room_id, None)
+                        mixer_to_stop = self.room_mixers.pop(room_id, None)
+                mixer = self.room_mixers.get(room_id)
+                if mixer is not None:
+                    mixer.remove_source(client_id)
 
         if mixer_to_stop is not None:
             mixer_to_stop.stop()
-        logging.info("%s disconnected", client_id)
+        if client is not None:
+            logging.info("%s disconnected", client_id)
 
     async def prune_dead_clients(self):
-        while True:
-            now = time.time()
-            with self.state_lock:
-                stale = [
-                    cid
-                    for cid, client in list(self.clients.items())
-                    if (now - client.last_heartbeat) > CLIENT_TIMEOUT_SEC
-                ]
-            for client_id in stale:
-                self.remove_client(client_id)
-            await asyncio.sleep(10)
+        while self.running:
+            self._prune_stale_clients_now()
+            await asyncio.sleep(5.0)
 
     @staticmethod
     def extract_sender_id(packet):
-        try:
-            parts = packet.split(b"|", 1)
-            if len(parts) == 2:
-                sender = parts[0].decode(errors="ignore").strip()
-                if sender:
-                    return sender
-
-            if b":" in packet:
-                sender = packet.split(b":", 1)[0].decode(errors="ignore").strip()
-                if sender:
-                    return sender
-        except Exception:
-            pass
-        return None
+        if not packet:
+            return None
+        if b":" not in packet:
+            return None
+        header = packet.split(b":", 1)[0]
+        parts = header.split(b"|", 1)
+        if not parts:
+            return None
+        sender_id = parts[0].decode(errors="ignore").strip()
+        return sender_id or None
 
     @staticmethod
     def extract_opus_payload(packet):
-        if not packet:
+        if not packet or b":" not in packet:
             return b""
-        if b":" in packet:
-            return packet.split(b":", 1)[1]
-        try:
-            first_sep = packet.index(b"|")
-            second_sep = packet.index(b"|", first_sep + 1)
-            return packet[second_sep + 1 :]
-        except ValueError:
-            return b""
+        return packet.split(b":", 1)[1]
 
-    def _start_decode_workers(self):
-        if self.decode_workers:
-            return
-        self.running = True
-        for idx in range(DECODE_WORKERS):
-            worker = threading.Thread(
-                target=self._decode_worker,
-                args=(idx,),
-                daemon=True,
-                name=f"decode-{idx}",
-            )
-            worker.start()
-            self.decode_workers.append(worker)
-
-    def _decode_worker(self, worker_id):
-        decoders = {}
-        while self.running:
-            try:
-                sender_id, room_id, opus_payload = self.decode_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-
-            decoder = decoders.get(sender_id)
-            if decoder is None:
-                try:
-                    decoder = OpusCodec(
-                        rate=16000,
-                        channels=1,
-                        frame_size=320,
-                        create_encoder=False,
-                        create_decoder=True,
-                    )
-                except Exception:
-                    continue
-                decoders[sender_id] = decoder
-
-            try:
-                pcm = decoder.decode(opus_payload)
-            except Exception:
-                continue
-
-            if not pcm:
-                continue
-            self._dispatch_decoded_frame(sender_id, room_id, pcm)
-
-    def _dispatch_decoded_frame(self, sender_id, room_id, pcm):
-        mixers_to_start = []
-        target_mixers = []
+    def _get_or_create_decoder(self, sender_id):
         with self.state_lock:
-            sender = self.clients.get(sender_id)
-            if sender is None or sender.room != room_id:
-                return
-            if not sender.targets:
-                return
+            decoder = self.sender_decoders.get(sender_id)
+        if decoder is not None:
+            return decoder
 
-            room_clients = list(self.rooms.get(room_id, set()))
-            for listener_id in room_clients:
-                if listener_id == sender_id:
-                    continue
-                if listener_id not in sender.targets:
-                    continue
-                listener = self.clients.get(listener_id)
-                if listener is None:
-                    continue
+        decoder = OpusCodec(
+            rate=16000,
+            channels=1,
+            frame_size=MIX_FRAME_SAMPLES,
+            create_encoder=False,
+            create_decoder=True,
+        )
+        with self.state_lock:
+            existing = self.sender_decoders.get(sender_id)
+            if existing is not None:
+                return existing
+            self.sender_decoders[sender_id] = decoder
+        return decoder
 
-                mixer = self.personal_mixers.get(listener_id)
-                if mixer is None:
-                    mixer = PersonalizedMixer(listener_id)
-                    self.personal_mixers[listener_id] = mixer
-                    mixers_to_start.append(mixer)
-                target_mixers.append(mixer)
+    def _sender_has_live_targets_locked(self, sender):
+        if not sender.targets:
+            return False
+        if not sender.room:
+            return False
+        room_members = self.rooms.get(sender.room, set())
+        for target_id in sender.targets:
+            if target_id in room_members and target_id != sender.client_id:
+                return True
+        return False
 
-        for mixer in mixers_to_start:
-            mixer.start()
-        for mixer in target_mixers:
-            mixer.add_pcm(sender_id, pcm)
-
-    async def start_audio_server(self):
-        logging.info("Audio UDP listening on port %s", AUDIO_PORT)
-        while True:
-            packet, addr = await self.loop.sock_recvfrom(self.udp_sock, 4096)
-            self.forward_packet(packet, addr)
-
-    def forward_packet(self, packet, addr):
+    def process_audio_packet(self, packet, addr):
         if not packet:
             return
         if addr is None:
@@ -446,7 +512,7 @@ class VoiceServer:
         sender_id = self.extract_sender_id(packet)
         if sender_id is None:
             self.malformed_count += 1
-            if self.malformed_count % 50 == 1:
+            if self.malformed_count % 100 == 1:
                 logging.warning(
                     "Malformed audio packets=%s latest_from=%s",
                     self.malformed_count,
@@ -456,23 +522,14 @@ class VoiceServer:
 
         with self.state_lock:
             sender = self.clients.get(sender_id)
+            if sender is None:
+                return
+            sender.last_heartbeat = time.time()
+            room_id = sender.room
+            can_mix = self._sender_has_live_targets_locked(sender)
+
         self.packet_count[sender_id] += 1
-        pkt_count = self.packet_count[sender_id]
-        if sender is None:
-            if pkt_count % 500 == 1:
-                logging.warning("Audio from unregistered sender: %s", sender_id)
-            return
-
-        if addr[0] != "unknown" and addr[0] != sender.addr[0] and pkt_count % 100 == 1:
-            logging.warning(
-                "IP mismatch warning for %s: expected %s, got %s. Allowing anyway.",
-                sender_id,
-                sender.addr[0],
-                addr[0],
-            )
-
-        room_id = sender.room
-        if not room_id:
+        if not room_id or not can_mix:
             return
 
         opus_payload = self.extract_opus_payload(packet)
@@ -480,32 +537,117 @@ class VoiceServer:
             return
 
         try:
-            self.decode_queue.put_nowait((sender_id, room_id, opus_payload))
-        except queue.Full:
-            if pkt_count % 200 == 1:
-                logging.warning("Decode queue full; dropping packet from %s", sender_id)
+            decoder = self._get_or_create_decoder(sender_id)
+            pcm = decoder.decode(opus_payload)
+        except Exception as err:
+            logging.debug("Decode error from %s: %s", sender_id, err)
+            return
 
-    async def send_personalized_mixes(self):
-        while True:
+        if not pcm:
+            return
+
+        mixer = self.get_or_create_mixer(room_id)
+        mixer.add_pcm(sender_id, pcm)
+
+    async def start_audio_server(self):
+        logging.info("Audio UDP listening on port %s", AUDIO_PORT)
+        while self.running:
+            try:
+                packet, addr = await self.loop.sock_recvfrom(self.udp_sock, 4096)
+            except asyncio.CancelledError:
+                raise
+            except OSError:
+                if self.running:
+                    logging.exception("UDP receive loop error")
+                break
+            self.process_audio_packet(packet, addr)
+
+    async def send_room_mixes(self):
+        while self.running:
             with self.state_lock:
-                mixers = list(self.personal_mixers.items())
-                listeners = {cid: self.clients.get(cid) for cid, _ in mixers}
+                room_entries = []
+                for room_id, mixer in self.room_mixers.items():
+                    listeners = []
+                    for client_id in self.rooms.get(room_id, set()):
+                        client = self.clients.get(client_id)
+                        if client is not None:
+                            listeners.append((client_id, client.addr))
+                    room_entries.append((mixer, listeners))
 
-            stale_listener_ids = []
-            for listener_id, mixer in mixers:
-                listener = listeners.get(listener_id)
-                if listener is None:
-                    stale_listener_ids.append(listener_id)
+            for mixer, listeners in room_entries:
+                if not listeners:
                     continue
-                for packet in mixer.drain_packets(limit=64):
-                    try:
-                        await self.loop.sock_sendto(self.udp_sock, packet, listener.addr)
-                    except OSError as err:
-                        logging.error("Unicast send error to %s: %s", listener_id, err)
+                packets = mixer.drain_packets(limit=64)
+                if not packets:
+                    continue
+                for packet, active_sender_ids in packets:
+                    skip_self_id = active_sender_ids[0] if len(active_sender_ids) == 1 else None
+                    for listener_id, listener_addr in listeners:
+                        if skip_self_id is not None and listener_id == skip_self_id:
+                            continue
 
-            for stale_id in stale_listener_ids:
-                self.remove_client(stale_id)
+                        with self.state_lock:
+                            listener = self.clients.get(listener_id)
+                            hear_targets = None if listener is None else listener.hear_targets
+
+                        # If listener configured explicit hear targets, suppress packets that
+                        # include any speaker outside that allow-list.
+                        if hear_targets is not None:
+                            active_others = [sid for sid in active_sender_ids if sid != listener_id]
+                            if any(sid not in hear_targets for sid in active_others):
+                                continue
+
+                        try:
+                            await self.loop.sock_sendto(self.udp_sock, packet, listener_addr)
+                        except OSError as err:
+                            logging.debug("UDP send error to %s: %s", listener_addr, err)
+
             await asyncio.sleep(0.002)
+
+    async def shutdown(self):
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+        self.running = False
+
+        current_task = asyncio.current_task()
+        pending = [task for task in self.tasks if task is not current_task and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self.tasks.clear()
+
+        if self.control_server is not None:
+            self.control_server.close()
+            try:
+                await self.control_server.wait_closed()
+            except Exception:
+                pass
+            self.control_server = None
+
+        if self.udp_sock is not None:
+            try:
+                self.udp_sock.close()
+            except OSError:
+                pass
+            self.udp_sock = None
+
+        if self.discovery_thread is not None and self.discovery_thread.is_alive():
+            self.discovery_thread.join(timeout=1.0)
+        self.discovery_thread = None
+
+        with self.state_lock:
+            mixers = list(self.room_mixers.values())
+            self.room_mixers.clear()
+            self.clients.clear()
+            self.rooms.clear()
+            self.sender_decoders.clear()
+
+        for mixer in mixers:
+            mixer.stop()
+
+        logging.info("Shutdown complete. UDP/TCP ports released.")
 
     async def start(self):
         logging.basicConfig(
@@ -513,44 +655,49 @@ class VoiceServer:
             format="[SERVER] %(asctime)s %(levelname)s %(message)s",
         )
         self.loop = asyncio.get_running_loop()
+        self.running = True
 
-        self._cleanup_stale_self_processes()
-        self._raise_if_ports_busy()
+        try:
+            self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+            _set_socket_dscp(self.udp_sock, IP_TOS_EF)
+            self.udp_sock.bind(("0.0.0.0", AUDIO_PORT))
+            self.udp_sock.setblocking(False)
 
-        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
-        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
-        _set_socket_dscp(self.udp_sock, IP_TOS_EF)
-        self.udp_sock.bind(("0.0.0.0", AUDIO_PORT))
-        self.udp_sock.setblocking(False)
+            self.discovery_thread = threading.Thread(
+                target=self.broadcast_server,
+                daemon=True,
+                name="discovery-broadcast",
+            )
+            self.discovery_thread.start()
 
-        self._start_decode_workers()
-        threading.Thread(
-            target=self.broadcast_server,
-            daemon=True,
-            name="discovery-broadcast",
-        ).start()
+            self.control_server = await asyncio.start_server(self.handle_control, "0.0.0.0", CONTROL_PORT)
+            for sock in self.control_server.sockets or []:
+                _set_socket_dscp(sock, IP_TOS_CS3)
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+            logging.info("Control TCP listening on port %s", CONTROL_PORT)
 
-        control_server = await asyncio.start_server(self.handle_control, "0.0.0.0", CONTROL_PORT)
-        for sock in control_server.sockets or []:
-            _set_socket_dscp(sock, IP_TOS_CS3)
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except OSError:
-                pass
-        logging.info("Control TCP listening on port %s", CONTROL_PORT)
+            self.tasks = [
+                asyncio.create_task(self.prune_dead_clients()),
+                asyncio.create_task(self.start_audio_server()),
+                asyncio.create_task(self.send_room_mixes()),
+            ]
 
-        asyncio.create_task(self.prune_dead_clients())
-        asyncio.create_task(self.start_audio_server())
-        asyncio.create_task(self.send_personalized_mixes())
-
-        async with control_server:
-            await control_server.serve_forever()
+            async with self.control_server:
+                await self.control_server.serve_forever()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await self.shutdown()
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(VoiceServer().start())
-    except RuntimeError as err:
-        print(f"[SERVER] Startup failed: {err}")
+    except KeyboardInterrupt:
+        pass

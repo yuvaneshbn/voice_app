@@ -95,6 +95,7 @@ class StartupDialog(QDialog):
     
     def accept(self):
         candidate = self.name_input.text().strip()
+        candidate = candidate.rstrip(",")
 
         if not candidate:
             msg = QMessageBox(self)
@@ -104,11 +105,11 @@ class StartupDialog(QDialog):
             msg.exec()
             return
 
-        if ":" in candidate:
+        if any(ch in candidate for ch in (":", "|", ",", "\n", "\r", "\t")):
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Warning)
             msg.setWindowTitle("Invalid Name")
-            msg.setText("Name cannot contain ':'.")
+            msg.setText("Name cannot contain ':', '|', ',' or control characters.")
             msg.exec()
             return
 
@@ -124,6 +125,14 @@ class StartupDialog(QDialog):
         self.client_id = candidate
         super().accept()
 
+    @staticmethod
+    def _parse_list_response(response):
+        if not response:
+            return []
+        if "\n" in response:
+            return [name.strip() for name in response.splitlines() if name.strip()]
+        return [name.strip() for name in response.split(",") if name.strip()]
+
     def _is_name_available(self, candidate):
         ctrl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -138,7 +147,7 @@ class StartupDialog(QDialog):
             response = ctrl.recv(1024).decode(errors="ignore").strip()
             if not response:
                 return True
-            existing = {name.strip() for name in response.split(",") if name.strip()}
+            existing = set(self._parse_list_response(response))
             return candidate not in existing
         except Exception:
             # If list check fails, registration flow in main.py still enforces uniqueness.

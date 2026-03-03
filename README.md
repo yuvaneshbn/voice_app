@@ -1,145 +1,149 @@
-# Voice App (LAN Low-Latency Intercom)
+# Voice App (LAN Intercom)
 
-Voice App is a LAN voice communication system designed for low-latency, real-time communication.
-It uses a hybrid transport model:
+Voice App is a Windows-focused LAN voice intercom system for low-latency communication.
+It uses:
 
-- UDP for real-time audio media
-- TCP for control signaling
+- UDP for audio media (`50002`)
+- TCP for control signaling (`50001`)
+- UDP discovery (`50000`)
 
-The project provides a desktop client (PySide6), a lightweight forwarding server, native audio processing integration, and QoS support for traffic prioritization.
+The repository includes:
+
+- A PySide6 desktop client
+- A Python asyncio server with per-room audio mixing
+- Native audio helper DLL integration (`native_mixer.dll`)
+- Optional Windows QoS policy installer
 
 ## Table of Contents
 
 1. Overview
-2. Feature Summary
+2. Current Feature Set
 3. Architecture
-4. QoS Design (Hybrid UDP/TCP)
-5. Repository Structure
-6. Requirements
-7. Setup (Source)
-8. Running Server and Client
-9. Client UI Guide
-10. Protocol Reference
-11. Audio Pipeline Details
+4. Repository Layout
+5. Requirements
+6. Setup (Source)
+7. Run from Source
+8. Client Workflow and UI
+9. Protocol Reference
+10. Audio Pipeline (Current Implementation)
+11. QoS and DSCP
 12. Build Native DLL
-13. Build Windows QoS Installer EXE
-14. Build Client EXE (PyInstaller)
-15. Build Server EXE (PyInstaller)
-16. Full EXE Build Process (Step-by-Step)
-17. Validation Checklist
-18. Troubleshooting
-19. Development Notes
-20. License
+13. Build EXEs (PyInstaller)
+14. Validation Checklist
+15. Troubleshooting
+16. Known Limitations
+17. Development Notes
+18. License
 
 ## 1. Overview
 
-Voice App follows an SFU-style design:
+This is a room-based voice chat system:
 
-- Server receives encoded UDP audio packets and forwards them.
-- Clients capture, encode, send, receive, decode, and mix audio locally.
-- TCP controls client lifecycle and routing.
+- Clients capture mic PCM, encode with Opus, and send UDP packets to server.
+- Server decodes each sender stream, mixes active speakers per room, re-encodes to Opus, and unicasts mixed audio to listeners in that room.
+- Client UI controls who you talk to (`TARGETS`) and who you hear (`HEAR`).
 
-This keeps server CPU load low and enables horizontal scaling for LAN intercom scenarios.
+The default room is `main`.
 
-## 2. Feature Summary
+## 2. Current Feature Set
 
 ### Networking
 
-- Auto-discovery of server over UDP broadcast
-- Manual server IP fallback dialog
-- Unique client name registration
-- Room join support (default room: `main`)
-- Directed voice routing via target list
-- Heartbeat/liveness checks
-- Graceful unregister on client exit
+- Server discovery over LAN
+  - Server periodic broadcast: `VOICE_SERVER`
+  - Client active probe packet: `VOICE_DISCOVER`
+- Manual server IP entry fallback
+- Client registration with shared secret
+- Heartbeat (`PING`) and stale-client pruning
+- Room join (`JOIN`) and participant listing (`LIST`)
+- Directed talk targets and listener hear-filters
 
 ### Audio
 
-- Opus codec on 20 ms frames at 16 kHz
-- UDP media path on port `50002`
-- Per-sender jitter buffering with adaptive depth
-- Loss concealment/resync handling
-- Per-stream leveling and mixed output limiting
-- Native echo cancellation integration (`native_mixer.dll`)
+- Opus codec, 16 kHz mono, 20 ms frame (`320` samples)
+- One UDP media socket per client
+- Server-side per-room real-time mixer (`RoomMixer`)
+- Voice activity thresholding on server to reduce silent sources
+- Client playback callback with packet loss concealment fallback
+- Optional native echo cancellation (`native_mixer.dll`) support
 
 ### UI
 
-- Qt Designer `.ui`-based main window and dialogs
-- Searchable participant list
-- Per-participant talk/mute controls
-- Per-participant mic and level indicators
-- Broadcast toggle (`On`/`Off`)
-- Active speaker summary (`Client X - talking/listening`)
-- Settings dialog for audio devices and advanced audio controls
-- Connection status indicator
+- Qt `.ui` based forms loaded via `QUiLoader`
+- Participant list with search filter
+- Per-participant:
+  - `Talk` checkbox
+  - `Mute` checkbox
+  - volume bar
+  - mic status text
+- Broadcast toggle (`Broadcast On`/`Broadcast Off`)
+- Connection indicator and status bar
+- Settings dialog:
+  - input/output device selection
+  - reconnect action
+  - advanced audio controls (master volume, gain, noise suppression, echo toggle, mic test)
 
 ## 3. Architecture
 
-### Core Components
+### Client (`client/`)
 
-- `server/server.py`
-  - TCP control listener (`50001`)
-  - UDP audio forwarder (`50002`)
-  - Client registry, room registry, target routing
-- `client/main.py`
-  - App entry, startup flow, UI wiring, control commands
-- `client/audio.py`
-  - Capture, encode/decode, jitter, mix, send/receive
-- `client/network.py`
-  - Discovery broadcast handling
-- `audio_native/*`
-  - Native echo/audio processing bridge and build files
+- `main.py`
+  - startup flow
+  - server discovery and manual IP fallback
+  - registration/join/reconnect
+  - main window and settings dialog wiring
+  - participant and routing state updates
+- `audio.py`
+  - mic capture/send loop
+  - receive/decode/playback loop
+  - device enumeration and selection
+  - runtime audio controls
+- `network.py`
+  - discovery socket logic
+- `opus_codec.py`
+  - ctypes wrapper around `opus.dll`
+- `echo_cancel.py` + `native_mixer.py`
+  - native echo-cancel API wrapper (if DLL available)
 
-### End-to-End Flow
+### Server (`server/`)
 
-1. Client discovers server (`VOICE_SERVER`) or prompts for manual IP.
-2. Client registers over TCP.
-3. Client joins room `main` and receives multicast group info.
-4. Client updates talk targets from UI actions.
-5. Audio packets flow over UDP and are forwarded by server.
-6. Client leaves room or exits, then unregisters.
+- `server.py`
+  - TCP control server (`50001`)
+  - UDP media server (`50002`)
+  - room membership and client state
+  - per-room `RoomMixer` thread:
+    - receives decoded PCM frames
+    - mixes and applies scaling
+    - encodes mixed Opus payloads
+    - queues mixed packets for send loop
+  - send loop applies `HEAR` filtering per listener
 
-## 4. QoS Design (Hybrid UDP/TCP)
+### Transport and Ports
 
-### Classification and Marking
+- `50000/UDP` discovery
+- `50001/TCP` control
+- `50002/UDP` audio media
 
-- Real-time audio (UDP): DSCP `46` (`EF`)
-- Control signaling (TCP): DSCP `24` (`CS3`)
-- Discovery traffic: treated as control class (`CS3`)
-
-Socket-level DSCP marking is implemented in client and server code paths.
-
-### Queueing Recommendations (Network Devices)
-
-Marking alone is not sufficient. Switches/routers should:
-
-1. Trust DSCP at access ports.
-2. Map `EF (46)` to strict priority queue.
-3. Map `CS3 (24)` to high-priority non-strict queue.
-4. Reserve bandwidth for active voice streams.
-5. Police EF queue to avoid starvation.
-
-See also: `docs/qos_policy.md`
-
-## 5. Repository Structure
+## 4. Repository Layout
 
 ```text
 Two-way-switch1/
   audio_native/
+    build_native.ps1
+    CMakeLists.txt
     native_mixer.dll
     echo_cancel.cpp
     webrtc_apm.cpp
     webrtc_apm.h
-    CMakeLists.txt
-    build_native.ps1
   client/
     main.py
     audio.py
     network.py
     startup_dialog.py
     opus_codec.py
-    echo_cancel.py
     native_mixer.py
+    echo_cancel.py
+    VoiceClient.spec
     technical-support.ico
     ui/
       main_window.ui
@@ -148,8 +152,11 @@ Two-way-switch1/
       volume_control.ui
     opus/
       opus.dll
+    opus.dll
   server/
     server.py
+    server.spec
+    opus_codec.py
   tools/
     qos_policy_installer.py
     build_qos_installer.ps1
@@ -157,20 +164,26 @@ Two-way-switch1/
     qos_policy.md
   opus/
     opus.dll
-  README.md
   requirements.txt
+  README.md
 ```
 
-## 6. Requirements
+## 5. Requirements
 
 - Windows 10/11
 - Python 3.11+
-- Functional microphone and speaker/headset
-- LAN connectivity for clients/server
+- Working microphone and speaker/headset
+- LAN connectivity
 
-## 7. Setup (Source)
+Python dependencies:
 
-From repository root:
+```powershell
+pip install -r requirements.txt
+```
+
+## 6. Setup (Source)
+
+From repo root:
 
 ```powershell
 python -m venv .venv
@@ -178,12 +191,15 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Required runtime binaries:
+Ensure runtime binaries exist:
 
-- `audio_native/native_mixer.dll`
-- `client/opus.dll` or `client/opus/opus.dll`
+- `audio_native/native_mixer.dll` (optional but recommended)
+- Opus DLL in one of these locations:
+  - `client/opus/opus.dll`
+  - `client/opus.dll`
+  - `opus/opus.dll`
 
-## 8. Running Server and Client
+## 7. Run from Source
 
 ### Start Server
 
@@ -192,7 +208,7 @@ cd server
 python server.py
 ```
 
-Expected logs:
+Expected startup logs include:
 
 - `Control TCP listening on port 50001`
 - `Audio UDP listening on port 50002`
@@ -204,102 +220,122 @@ cd client
 python main.py
 ```
 
-Startup steps:
+Startup sequence:
 
-1. Server discovery.
-2. Manual IP prompt if needed.
-3. Unique client name entry.
-4. Registration + join room `main`.
+1. Client attempts discovery.
+2. If not found, asks for manual server IP.
+3. User enters unique client name.
+4. Client sends `REGISTER` and `JOIN`.
 5. Main window opens.
 
-## 9. Client UI Guide
+## 8. Client Workflow and UI
 
-### Top Toolbar
+### Participant Routing
 
-- Room (default `main`)
-- Leave Room (unregister + exit)
-- Refresh List
-- Connected/Disconnected indicator
+- `Talk` checked for one or more users: your mic stream is sent and routed to those targets.
+- `Mute` checked on a participant: that participant is excluded from your local `HEAR` allow-list.
+- `Broadcast On`: all other participants are auto-selected as targets.
 
-### Participants
+### Connection and Heartbeat
 
-- Search input filters participants
-- Row fields:
-  - client name
-  - `Talk` checkbox
-  - `Mute` checkbox
-  - mic state
-  - volume bar
+- Client sends periodic `PING`.
+- After consecutive failures, UI marks as disconnected.
+- Settings dialog includes `Reconnect` to re-register/join quickly.
 
-### Active Speakers
+### Settings Device List Behavior
 
-- Status lines like:
-  - `Client alpha - talking`
-  - `Client bravo - listening`
-- Speaker log list
-- System level bar
+The app now prefers one host API family (WASAPI first) and de-duplicates generic aliases in the settings dropdown.
+This reduces duplicate entries that represent the same physical device through multiple Windows audio APIs.
 
-### My Controls
+## 9. Protocol Reference
 
-- Master volume
-- Gain
-- Output level
-- Mic sensitivity
-- Noise suppression
-- Auto gain
-- Echo cancellation
-- Test mic
+### Discovery
 
-### Bottom Controls
+- Server broadcasts: `VOICE_SERVER` on UDP `50000`
+- Client probes: `VOICE_DISCOVER` on UDP `50000`
 
-- Mute mic
-- Broadcast toggle
-- Settings
-
-## 10. Protocol Reference
-
-### Ports
-
-- `50000/UDP` discovery
-- `50001/TCP` control
-- `50002/UDP` media
-
-### Control Commands
+### Control Commands (TCP `50001`)
 
 - `REGISTER:<client_id>:<audio_port>[:<secret>]`
 - `JOIN:<client_id>:<room_id>`
 - `LIST` or `LIST:<client_id>`
 - `PING:<client_id>`
 - `TARGETS:<client_id>:<csv_targets>`
+- `HEAR:<client_id>:<csv_targets>`
 - `UNREGISTER:<client_id>`
 
-### Common Responses
+Typical responses:
 
 - `OK`
-- `OK:<multicast_addr>`
+- `OK:<multicast_addr>` (legacy field retained by server response format)
 - `TAKEN`
 - `ERR`
 
-## 11. Audio Pipeline Details
+### Registration Secret
 
-### Transmit
+Default secret currently used by code:
 
-- PCM16 mono, 16 kHz
-- Frame size: 320 samples (20 ms)
-- Opus encode + sequence/timestamp header
+- Client: `VOICE_REGISTER_SECRET` env var (default `mysecret`)
+- Server constant: `SERVER_SECRET = "mysecret"`
 
-### Receive
+If you change one, update the other to match.
 
-- Per-sender jitter buffers
-- Adaptive jitter target
-- Gap handling and quick resync
-- Mixed output with soft clipping
+## 10. Audio Pipeline (Current Implementation)
 
-### Safety
+### Client Transmit
 
-- Capture start/stop protected by lock
-- Send thread lifecycle guards
-- Echo processing guarded to avoid race crashes
+1. Read PCM16 mono frame (`320` samples).
+2. Apply UI-driven controls:
+   - tx mute
+   - gain and sensitivity shaping
+   - optional noise gate
+   - optional echo cancel capture path
+3. Opus encode.
+4. Send packet: `client_id|seq|timestamp:opus_payload`.
+
+### Server Mix
+
+1. Parse sender id and payload.
+2. Decode sender Opus to PCM.
+3. Feed sender PCM into room mixer.
+4. Mixer thread combines active source frames every ~20 ms.
+5. Re-encode mixed PCM to Opus as `MIXED|seq|opus`.
+6. Send to room listeners, enforcing listener `HEAR` filters.
+
+### Client Receive/Playback
+
+1. Receive mixed packet.
+2. Decode Opus to PCM.
+3. Push frame into local receive queue.
+4. Playback callback consumes queue and applies volume.
+5. If queue underflows, uses Opus PLC (`decode(None)`) or silence fallback.
+
+## 11. QoS and DSCP
+
+Implemented DSCP markings:
+
+- Audio UDP: EF (`46`)
+- Control TCP + discovery: CS3 (`24`)
+
+Windows QoS installer:
+
+- Script: `tools/qos_policy_installer.py`
+- Build helper: `tools/build_qos_installer.ps1`
+- Output: `dist/VoiceQoSSetup.exe`
+
+Install:
+
+```powershell
+.\dist\VoiceQoSSetup.exe
+```
+
+Remove:
+
+```powershell
+.\dist\VoiceQoSSetup.exe --remove
+```
+
+More details: `docs/qos_policy.md`.
 
 ## 12. Build Native DLL
 
@@ -307,7 +343,7 @@ Startup steps:
 .\audio_native\build_native.ps1
 ```
 
-Alternative:
+CMake alternative:
 
 ```powershell
 cmake -S audio_native -B audio_native\build
@@ -318,107 +354,51 @@ Expected output:
 
 - `audio_native/native_mixer.dll`
 
-## 13. Build Windows QoS Installer EXE
+## 13. Build EXEs (PyInstaller)
 
-Build:
+Install PyInstaller first:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools/build_qos_installer.ps1
+pip install pyinstaller
+```
+
+### Client EXE (recommended: spec file)
+
+```powershell
+cd client
+pyinstaller --noconfirm --clean VoiceClient.spec
 ```
 
 Output:
 
-- `dist/VoiceQoSSetup.exe`
+- `client/dist/VoiceClient.exe`
 
-Use:
+The spec already includes:
 
-```powershell
-.\dist\VoiceQoSSetup.exe
-```
+- `.ui` files
+- app icon
+- `opus.dll`
+- `native_mixer.dll`
+- `PySide6.QtUiTools` hidden import
 
-Remove policies:
-
-```powershell
-.\dist\VoiceQoSSetup.exe --remove
-```
-
-## 14. Build Client EXE (PyInstaller)
-
-The client UI uses external `.ui` files. If you do not package `client/ui`, the EXE may show startup dialog only and fail to open the main window.
-
-### Debug Build (recommended first)
-
-Run from `client` folder:
+### Server EXE (spec file)
 
 ```powershell
-pyinstaller --noconfirm --clean --onefile --console `
-  --name VoiceClient `
-  --icon "technical-support.ico" `
-  --hidden-import PySide6.QtUiTools `
-  --add-data "ui;ui" `
-  --add-data "technical-support.ico;." `
-  --add-binary "opus.dll;opus" `
-  --add-binary "native_mixer.dll;audio_native" `
-  main.py
-```
-
-Test:
-
-```powershell
-.\dist\VoiceClient.exe
-```
-
-### Final GUI Build
-
-```powershell
-pyinstaller --noconfirm --clean --onefile --windowed `
-  --name VoiceClient `
-  --icon "technical-support.ico" `
-  --hidden-import PySide6.QtUiTools `
-  --add-data "ui;ui" `
-  --add-data "technical-support.ico;." `
-  --add-binary "opus.dll;opus" `
-  --add-binary "native_mixer.dll;audio_native" `
-  main.py
-```
-
-## 15. Build Server EXE (PyInstaller)
-
-From `server` folder:
-
-```powershell
+cd server
 pyinstaller --noconfirm --clean server.spec
+or
+pyinstaller --onefile server.py
 ```
 
-This spec bundles Opus for frozen builds (`..\opus\opus.dll -> opus\opus.dll`), so `server.exe` can start without requiring a separate local DLL copy.
+Output:
 
-## 16. Full EXE Build Process (Step-by-Step)
+- `server/dist/server.exe`
 
-Use this when you want to generate all EXEs from scratch.
+The spec bundles `..\opus\opus.dll` into `opus/` for frozen runtime loading.
 
-From repository root:
+### Optional Direct Command (without spec)
 
-```powershell
-cd C:\Users\YUVANESH\Desktop\projects\Two-way-switch1
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-pip install pyinstaller
-```
-
-Build native audio DLL (required for client EXE):
-
-```powershell
-.\audio_native\build_native.ps1
-```
-
-Build QoS installer EXE:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools/build_qos_installer.ps1
-```
-
-Build client EXE:
+Client:
 
 ```powershell
 cd client
@@ -433,116 +413,81 @@ pyinstaller --noconfirm --clean --onefile --windowed `
   main.py
 ```
 
-Build server EXE:
+Server:
 
 ```powershell
-cd ..\server
-Get-Process server -ErrorAction SilentlyContinue | Stop-Process -Force
+cd server
 pyinstaller --noconfirm --clean server.spec
 ```
 
-Output files:
+## 14. Validation Checklist
 
-- `dist/VoiceQoSSetup.exe`
-- `client/dist/VoiceClient.exe`
-- `server/dist/server.exe`
+1. Start server.
+2. Start two or more clients.
+3. Verify registration and participant list updates.
+4. Toggle talk targets and confirm remote audio path changes.
+5. Toggle participant mute and verify hear filtering.
+6. Toggle broadcast and verify all-target selection behavior.
+7. Verify reconnect button recovers after temporary disconnect.
+8. Verify clean exit unregisters client.
 
-Port verification for server (important):
+## 15. Troubleshooting
+
+### Settings shows too many input/output devices
+
+Windows exposes the same hardware through multiple APIs (MME/DirectSound/WASAPI/WDM-KS). The app now de-duplicates and prefers WASAPI.
+If you still see extra entries, use the WASAPI-labelled one.
+
+### Server discovery fails
+
+- Confirm server is running and port `50000/UDP` is open.
+- Confirm local firewall allows UDP broadcast.
+- Use manual server IP dialog.
+
+### Registration fails with `TAKEN`
+
+- Client name already exists.
+- Choose a different name.
+
+### No audio though connected
+
+- Ensure at least one `Talk` target is selected.
+- Ensure receiver has not muted sender.
+- Confirm UDP `50002` is allowed by firewall/network policy.
+
+### `opus.dll` not found
+
+- Ensure DLL is present in one supported runtime path.
+- For EXE builds, use provided `.spec` files.
+
+### Echo cancel unavailable
+
+- Check `audio_native/native_mixer.dll` exists and architecture matches Python interpreter.
+- If unavailable, app still runs without native echo cancellation.
+
+### Build fails because output EXE is in use
+
+Stop running process, then rebuild.
+Example for server port holder:
 
 ```powershell
 netstat -aon | findstr :50001
-netstat -aon | findstr :50002
-```
-
-If port is busy, note PID from the last column and stop it:
-
-```powershell
 taskkill /PID <PID> /F
 ```
 
-Then run the server EXE:
+## 16. Known Limitations
 
-```powershell
-cd ..\server\dist
-.\server.exe
-```
+- Audio format is currently fixed to 16 kHz mono.
+- Secret management is static by default (`mysecret`), suitable only for trusted LAN use unless hardened.
+- No TLS/auth hardening on control channel.
+- Legacy/generated `client/voice_ui.py` is not part of active runtime path.
 
-## 17. Validation Checklist
+## 17. Development Notes
 
-1. Start server and two clients.
-2. Verify both clients appear automatically in participant list.
-3. Verify talk target changes in server logs.
-4. Verify broadcast toggle updates targets correctly.
-5. Verify active speaker lines update (`talking`/`listening`).
-6. Verify leave room unregisters and exits.
-7. Verify QoS policies and DSCP values (optional, Wireshark).
+- Keep client and server packet formats synchronized when changing headers.
+- If you change control command parsing rules, update both UI flow and server handlers.
+- When packaging, prefer `.spec` files to avoid missing asset regressions.
 
-## 18. Troubleshooting
+## 18. License
 
-### Startup dialog appears but main window does not open in EXE
-
-- Cause: `.ui` files were not packaged.
-- Fix: include `--add-data "ui;ui"` and `--hidden-import PySide6.QtUiTools` in PyInstaller command.
-
-### Registration fails (`TAKEN`)
-
-- Client name already in use.
-- Choose another unique name.
-
-### No audio
-
-- Check `Talk` routing or Broadcast state.
-- Ensure receiver has not muted sender.
-- Confirm firewall allows UDP `50002`.
-
-### Server EXE fails with `Could not find opus.dll`
-
-- Cause: EXE was built without bundling Opus runtime DLL.
-- Fix: build from `server` folder using:
-  - `pyinstaller --noconfirm --clean server.spec`
-
-### PyInstaller build fails with `PermissionError: [WinError 5] Access is denied: ...\dist\server.exe`
-
-- Cause: `server.exe` is already running, so PyInstaller cannot overwrite it.
-- Check who is using port 50001:
-  - `netstat -aon | findstr :50001`
-- Stop the process by PID:
-  - `taskkill /PID <PID> /F`
-- Rebuild:
-  - `pyinstaller --noconfirm --clean server.spec`
-
-### Discovery fails
-
-- Ensure UDP `50000` is open.
-- Use manual server IP entry.
-
-### Jitter/missing sequence logs are frequent
-
-- Check LAN quality, congestion, and Wi-Fi stability.
-- Validate switch/router QoS trust and queue policy.
-
-### Echo issues or random audio crashes
-
-- Prefer headset during testing.
-- Verify `native_mixer.dll` architecture matches Python (x64/x64).
-- Check `client/client_crash.log` for native stack errors.
-
-### Window icon not shown
-
-- Ensure `technical-support.ico` is included in build.
-- For PyInstaller, include:
-  - `--icon "technical-support.ico"`
-  - `--add-data "technical-support.ico;."`
-
-## 19. Development Notes
-
-- Control plane is TCP for reliability.
-- Media plane is UDP for latency.
-- Server does not decode media.
-- Client handles decode/jitter/mix complexity.
-
-When changing protocol or packet format, update both client and server parsing and writer logic.
-
-## 20. License
-
-MIT License. See `LICENSE`.
+MIT License (`LICENSE`).

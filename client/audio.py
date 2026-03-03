@@ -1,23 +1,34 @@
-import socket, threading, pyaudio, struct, time
-from opus_codec import OpusCodec
+import socket
+import struct
+import threading
+import time
+from collections import deque
+
+import pyaudio
+
 from echo_cancel import EchoCanceller, echo_cancel_available
+from opus_codec import OpusCodec
 
 RATE = 16000
-FRAME = 320  # 20 ms @ 16 kHz (matches OpusCodec default)
+FRAME = 320  # 20 ms @ 16 kHz
 CHUNK = FRAME
-FRAME_MS = int(1000 * FRAME / RATE)
 AUDIO_PORT = 50002
 DSCP_EF = 46
 IP_TOS_EF = DSCP_EF << 2
+RX_QUEUE_MAX_FRAMES = 8
+DEVICE_HOST_PRIORITY = {
+    "windows wasapi": 0,
+    "windows wdm-ks": 1,
+    "windows directsound": 2,
+    "mme": 3,
+}
+GENERIC_DEVICE_NAMES = {
+    "microsoft sound mapper - input",
+    "microsoft sound mapper - output",
+    "primary sound capture driver",
+    "primary sound driver",
+}
 
-# Simple jitter buffer targets (ms)
-JITTER_MIN_MS = 20
-JITTER_TARGET_MS = 60
-JITTER_MAX_MS = 120
-
-MIN_FRAMES = max(1, JITTER_MIN_MS // FRAME_MS)
-TARGET_FRAMES = max(1, JITTER_TARGET_MS // FRAME_MS)
-MAX_FRAMES = max(2, JITTER_MAX_MS // FRAME_MS)
 
 def _set_socket_dscp(sock, ip_tos):
     try:
@@ -30,40 +41,34 @@ class AudioEngine:
     def __init__(self):
         self.client_id = None
         self.audio = pyaudio.PyAudio()
-
-        # Opus codec (frame size MUST match)
         self.codec = OpusCodec(rate=RATE, channels=1, frame_size=FRAME)
 
-        # ================= RECEIVE SOCKET =================
+        # Receive socket
         self.recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
         _set_socket_dscp(self.recv_sock, IP_TOS_EF)
-
-        # Bind to ephemeral port
         self.recv_sock.bind(("", 0))
         self.port = self.recv_sock.getsockname()[1]
 
-        # ================= AUDIO STATE =================
-        # Server-side mixing mode: one mixed stream per room.
-        self.rx_buffer = {}        # seq -> (pcm_bytes, arrival_time)
-        self.rx_expected_seq = None
-        self.rx_jitter_target = TARGET_FRAMES
-        self.rx_jitter_est = 0.0
-        self.rx_last_arrival = None
-        self.rx_last_adjust = 0.0
-        self.rx_synth_seq = 0
+        # Playback state (server sends mixed room stream)
+        self.rx_frames = deque(maxlen=RX_QUEUE_MAX_FRAMES)
         self.stream_levels = {}
+        self.jitter_stats = {"missing": 0, "received": 0}
+
         self.running = False
         self.listen_running = True
         self.stream_lock = threading.Lock()
         self.state_lock = threading.Lock()
+
         self.input = None
+        self.output = None
         self.send_sock = None
         self.send_thread = None
+        self.listen_thread = None
         self.server_ip = None
 
-        # Runtime audio controls (wired from UI)
+        # Runtime controls
         self.master_volume = 1.0
         self.output_volume = 1.0
         self.tx_gain_db = 0.0
@@ -77,14 +82,14 @@ class AudioEngine:
         self.input_device_index = None
         self.output_device_index = None
 
+        # Legacy echo wrapper: keep available, but off by default to avoid pipeline conflicts.
         self.echo = None
         self.echo_enabled = False
         self.echo_lock = threading.Lock()
         if echo_cancel_available():
             try:
                 self.echo = EchoCanceller(sample_rate=RATE, channels=1, frame_size=FRAME, delay_ms=60)
-                self.echo_enabled = True
-                print("[AUDIO] Native echo cancellation enabled")
+                print("[AUDIO] Native echo cancellation available (disabled by default)")
             except Exception as e:
                 print(f"[AUDIO] Native echo cancellation unavailable: {e}")
         else:
@@ -93,16 +98,10 @@ class AudioEngine:
         self.last_playout = b"\x00" * (FRAME * 2)
         self.seq = 0
         self.timestamp = 0
-        self.jitter_stats = {"missing": 0, "received": 0}
 
-        # ================= OUTPUT STREAM =================
-        self.output = None
         self._open_output_stream()
-
-        self.listen_thread = threading.Thread(target=self.listen, daemon=True)
+        self.listen_thread = threading.Thread(target=self.listen, daemon=True, name="audio-listen")
         self.listen_thread.start()
-
-    # --------------------------------------------------
 
     def _open_output_stream(self):
         if self.output is not None:
@@ -126,29 +125,74 @@ class AudioEngine:
         self.output = self.audio.open(**kwargs)
         self.output.start_stream()
 
-    # --------------------------------------------------
+    def _device_host_name(self, info):
+        try:
+            host_index = int(info.get("hostApi", -1))
+        except (TypeError, ValueError):
+            host_index = -1
+        if host_index < 0:
+            return ""
+        try:
+            host_info = self.audio.get_host_api_info_by_index(host_index)
+        except Exception:
+            return ""
+        return str(host_info.get("name", "")).strip()
+
+    def _list_devices(self, channel_key, fallback_name):
+        entries = []
+        try:
+            for i in range(self.audio.get_device_count()):
+                info = self.audio.get_device_info_by_index(i)
+                if int(info.get(channel_key, 0)) <= 0:
+                    continue
+
+                raw_name = str(info.get("name", f"{fallback_name} {i}")).strip()
+                if not raw_name:
+                    raw_name = f"{fallback_name} {i}"
+                host_name = self._device_host_name(info)
+                display_name = f"{raw_name} [{host_name}]" if host_name else raw_name
+
+                rank = DEVICE_HOST_PRIORITY.get(host_name.casefold(), 99)
+                key = raw_name.casefold()
+                entries.append(
+                    {
+                        "rank": rank,
+                        "index": i,
+                        "raw_name": raw_name,
+                        "display_name": display_name,
+                        "is_generic": key in GENERIC_DEVICE_NAMES,
+                    }
+                )
+        except Exception:
+            return []
+
+        if not entries:
+            return []
+
+        candidates = [entry for entry in entries if not entry["is_generic"]] or entries
+        best_rank = min(entry["rank"] for entry in candidates)
+        selected = [entry for entry in candidates if entry["rank"] == best_rank]
+
+        deduped = {}
+        for entry in selected:
+            key = entry["raw_name"].casefold()
+            current = deduped.get(key)
+            if current is None or entry["index"] < current["index"]:
+                deduped[key] = entry
+
+        return [
+            (entry["index"], entry["display_name"])
+            for entry in sorted(
+                deduped.values(),
+                key=lambda item: (item["raw_name"].casefold(), item["index"]),
+            )
+        ]
 
     def list_input_devices(self):
-        devices = []
-        try:
-            for i in range(self.audio.get_device_count()):
-                info = self.audio.get_device_info_by_index(i)
-                if int(info.get("maxInputChannels", 0)) > 0:
-                    devices.append((i, info.get("name", f"Input {i}")))
-        except Exception:
-            pass
-        return devices
+        return self._list_devices("maxInputChannels", "Input")
 
     def list_output_devices(self):
-        devices = []
-        try:
-            for i in range(self.audio.get_device_count()):
-                info = self.audio.get_device_info_by_index(i)
-                if int(info.get("maxOutputChannels", 0)) > 0:
-                    devices.append((i, info.get("name", f"Output {i}")))
-        except Exception:
-            pass
-        return devices
+        return self._list_devices("maxOutputChannels", "Output")
 
     def set_input_device(self, device_index):
         self.input_device_index = device_index
@@ -226,8 +270,6 @@ class AudioEngine:
                 pass
         return min(100, int((max_peak * 100) / 32767)) if max_peak else 0
 
-    # --------------------------------------------------
-
     def _callback(self, in_data, frame_count, *_):
         frame_bytes = frame_count * 2
         mixed_pcm = self.mix(frame_bytes)
@@ -242,32 +284,9 @@ class AudioEngine:
                 self.echo_enabled = False
         return (mixed_pcm, pyaudio.paContinue)
 
-    # --------------------------------------------------
-
     def mix(self, frame_bytes):
-        def seq_forward_distance(expected, candidate):
-            return (candidate - expected) & 0xFFFF
-
-        chunk = None
         with self.stream_lock:
-            if self.rx_expected_seq is not None:
-                target = max(MIN_FRAMES, self.rx_jitter_target)
-                if len(self.rx_buffer) >= target:
-                    exp = self.rx_expected_seq
-                    if exp in self.rx_buffer:
-                        chunk, _arr = self.rx_buffer.pop(exp)
-                        self.rx_expected_seq = (exp + 1) & 0xFFFF
-                    elif self.rx_buffer:
-                        next_seq = min(
-                            self.rx_buffer.keys(),
-                            key=lambda key: seq_forward_distance(exp, key),
-                        )
-                        gap = seq_forward_distance(exp, next_seq)
-                        if 0 < gap <= 8 or len(self.rx_buffer) >= target + 2:
-                            chunk, _arr = self.rx_buffer.pop(next_seq)
-                            self.rx_expected_seq = (next_seq + 1) & 0xFFFF
-                        else:
-                            self.rx_expected_seq = (exp + 1) & 0xFFFF
+            chunk = self.rx_frames.popleft() if self.rx_frames else None
 
         if chunk is None:
             self.jitter_stats["missing"] += 1
@@ -280,25 +299,22 @@ class AudioEngine:
         if len(chunk) != frame_bytes:
             chunk = (chunk + (b"\x00" * frame_bytes))[:frame_bytes]
 
-        data = struct.unpack("<" + "h" * (frame_bytes // 2), chunk)
-        peak = max(abs(sample) for sample in data) if data else 0
+        samples = struct.unpack("<" + "h" * (frame_bytes // 2), chunk)
+        peak = max(abs(sample) for sample in samples) if samples else 0
 
         volume_factor = max(0.0, min(2.0, self.master_volume * self.output_volume))
         if volume_factor != 1.0:
-            data = [
+            samples = [
                 max(-32768, min(32767, int(sample * volume_factor)))
-                for sample in data
+                for sample in samples
             ]
-        output_bytes = struct.pack("<" + "h" * len(data), *data)
+        output_bytes = struct.pack("<" + "h" * len(samples), *samples)
 
         with self.stream_lock:
             prev = self.stream_levels.get("__mixed__", peak)
-            level = (0.9 * prev) + (0.1 * peak)
-            self.stream_levels["__mixed__"] = level
+            self.stream_levels["__mixed__"] = (0.9 * prev) + (0.1 * peak)
 
         return output_bytes
-
-    # --------------------------------------------------
 
     def listen(self):
         print(f"[AUDIO] Listening for audio on port {self.port}")
@@ -309,37 +325,24 @@ class AudioEngine:
                 if self.listen_running:
                     print(f"[AUDIO] recv_sock error: {e}")
                 continue
-
             self._handle_incoming_packet(data, addr)
 
     def _handle_incoming_packet(self, data, addr):
-        seq = None
         opus = b""
 
         if data.startswith(b"MIXED|"):
             try:
-                _tag, seq_raw, opus = data.split(b"|", 2)
-                seq = int(seq_raw) & 0xFFFF
+                _tag, _seq_raw, opus = data.split(b"|", 2)
             except Exception:
                 return
         elif b":" in data:
-            # Backward compatibility with older server mode.
+            # Backward compatibility with older unicast format.
             header, opus = data.split(b":", 1)
             header_s = header.decode(errors="ignore")
-            if "|" in header_s:
-                parts = header_s.split("|")
-                sender_id = parts[0].strip()
-                if sender_id == self.client_id:
-                    return
-                if len(parts) > 1:
-                    try:
-                        seq = int(parts[1]) & 0xFFFF
-                    except ValueError:
-                        seq = None
-            else:
+            sender_id = header_s.split("|", 1)[0].strip()
+            if sender_id and sender_id == self.client_id:
                 return
         else:
-            # Plain mixed Opus packet (no header).
             opus = data
 
         if not opus:
@@ -356,36 +359,10 @@ class AudioEngine:
 
         frame_bytes = CHUNK * 2
         pcm = (pcm + (b"\x00" * frame_bytes))[:frame_bytes]
-        arrival_time = time.time()
-        self.jitter_stats["received"] += 1
 
         with self.stream_lock:
-            if seq is None:
-                seq = self.rx_synth_seq
-                self.rx_synth_seq = (self.rx_synth_seq + 1) & 0xFFFF
-
-            self.rx_buffer[seq] = (pcm, arrival_time)
-            if self.rx_expected_seq is None:
-                self.rx_expected_seq = seq
-
-            if self.rx_last_arrival is not None:
-                delta = arrival_time - self.rx_last_arrival
-                expected = FRAME / RATE
-                jitter = min(0.200, abs(delta - expected))
-                self.rx_jitter_est = (0.9 * self.rx_jitter_est) + (0.1 * jitter)
-            self.rx_last_arrival = arrival_time
-
-            if arrival_time - self.rx_last_adjust > 1.0:
-                if self.rx_jitter_est > 0.020:
-                    self.rx_jitter_target = min(MAX_FRAMES, self.rx_jitter_target + 1)
-                elif self.rx_jitter_est < 0.005:
-                    self.rx_jitter_target = max(MIN_FRAMES, self.rx_jitter_target - 1)
-                self.rx_last_adjust = arrival_time
-
-            while len(self.rx_buffer) > MAX_FRAMES:
-                self.rx_buffer.pop(min(self.rx_buffer.keys()), None)
-
-    # --------------------------------------------------
+            self.rx_frames.append(pcm)
+        self.jitter_stats["received"] += 1
 
     def start(self, server_ip):
         if not self.client_id:
@@ -402,7 +379,7 @@ class AudioEngine:
 
             self.running = True
             self.server_ip = server_ip
-            print(f"[AUDIO] Audio capture ACTIVE for {self.client_id} -> {server_ip}:50002")
+            print(f"[AUDIO] Audio capture ACTIVE for {self.client_id} -> {server_ip}:{AUDIO_PORT}")
 
         try:
             input_kwargs = dict(
@@ -437,7 +414,7 @@ class AudioEngine:
             print(f"[AUDIO] Failed to start capture: {e}")
             return
 
-        def send():
+        def send_loop():
             packet_count = 0
             while self.running:
                 try:
@@ -445,7 +422,6 @@ class AudioEngine:
                     samples = list(struct.unpack("<" + "h" * CHUNK, pcm))
                     input_peak = max(abs(s) for s in samples) if samples else 0
 
-                    # Capture telemetry for UI meters.
                     self.capture_level = min(100, int((input_peak * 100) / 32767))
                     activity_threshold = max(120, int(2200 - (self.mic_sensitivity * 16)))
                     self.capture_active = input_peak >= activity_threshold and not self.tx_muted
@@ -453,7 +429,6 @@ class AudioEngine:
                     if self.tx_muted:
                         samples = [0] * len(samples)
                     else:
-                        # Noise suppression slider behaves like a simple gate.
                         if self.noise_suppression_enabled:
                             gate = int((self.noise_suppression / 100.0) * 2500)
                             if gate > 0:
@@ -486,7 +461,7 @@ class AudioEngine:
                         packet = header + b":" + opus
                         self.seq = (self.seq + 1) & 0xFFFF
                         self.timestamp += FRAME
-                        self.send_sock.sendto(packet, (server_ip, 50002))
+                        self.send_sock.sendto(packet, (server_ip, AUDIO_PORT))
                         packet_count += 1
                         if packet_count % 100 == 0:
                             print(f"[AUDIO] Sent {packet_count} packets from {self.client_id}")
@@ -497,19 +472,18 @@ class AudioEngine:
                         break
                     print(f"[AUDIO] Send error: {e}")
 
-        self.send_thread = threading.Thread(target=send, daemon=True)
+        self.send_thread = threading.Thread(target=send_loop, daemon=True, name="audio-send")
         self.send_thread.start()
 
-    # --------------------------------------------------
-
     def stop(self):
-        # Stop capture only (keep receive/output alive)
         with self.state_lock:
             self.running = False
             send_thread = self.send_thread
             self.send_thread = None
+
         self.capture_active = False
         self.capture_level = 0
+
         if send_thread and send_thread.is_alive():
             send_thread.join(timeout=1.5)
 
@@ -529,9 +503,9 @@ class AudioEngine:
             pass
 
     def shutdown(self):
-        # Full shutdown (called on app exit)
         self.stop()
         self.listen_running = False
+
         with self.echo_lock:
             if self.echo is not None:
                 try:
@@ -546,10 +520,14 @@ class AudioEngine:
         except Exception:
             pass
 
+        if self.listen_thread and self.listen_thread.is_alive():
+            self.listen_thread.join(timeout=1.0)
+
         try:
             if self.output is not None:
                 self.output.stop_stream()
                 self.output.close()
+                self.output = None
         except Exception:
             pass
 
