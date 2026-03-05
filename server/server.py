@@ -46,7 +46,7 @@ class Client:
 
 
 class RoomMixer:
-    """One mixer thread per room with a bounded output packet queue."""
+    """One mixer thread per room with a bounded output frame queue."""
 
     def __init__(self, room_id):
         self.room_id = room_id
@@ -55,14 +55,7 @@ class RoomMixer:
         self.lock = threading.Lock()
         self.seq = 0
         self.running = True
-        self.encoder = OpusCodec(
-            rate=16000,
-            channels=1,
-            frame_size=MIX_FRAME_SAMPLES,
-            bitrate=48000,
-            create_encoder=True,
-            create_decoder=False,
-        )
+        self.listener_encoders = {}
         self.mixed_queue = queue.Queue(maxsize=ROOM_MIX_QUEUE_MAX)
         self._thread = threading.Thread(
             target=self._mix_loop,
@@ -124,20 +117,39 @@ class RoomMixer:
         clamped = [max(-32768, min(32767, sample)) for sample in scaled]
         return struct.pack("<320h", *clamped)
 
-    def _enqueue_packet(self, opus_payload, active_sender_ids):
-        packet = f"MIXED|{self.seq}|".encode("ascii") + opus_payload
+    def _enqueue_mix_frame(self, source_items):
+        frame = (self.seq, tuple(source_items))
         self.seq = (self.seq + 1) & 0xFFFF
         try:
-            self.mixed_queue.put_nowait((packet, tuple(active_sender_ids)))
+            self.mixed_queue.put_nowait(frame)
         except queue.Full:
             try:
                 self.mixed_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self.mixed_queue.put_nowait((packet, tuple(active_sender_ids)))
+                self.mixed_queue.put_nowait(frame)
             except queue.Full:
                 pass
+
+    def get_or_create_listener_encoder(self, listener_id):
+        with self.lock:
+            encoder = self.listener_encoders.get(listener_id)
+            if encoder is None:
+                encoder = OpusCodec(
+                    rate=16000,
+                    channels=1,
+                    frame_size=MIX_FRAME_SAMPLES,
+                    bitrate=48000,
+                    create_encoder=True,
+                    create_decoder=False,
+                )
+                self.listener_encoders[listener_id] = encoder
+            return encoder
+
+    def remove_listener(self, listener_id):
+        with self.lock:
+            self.listener_encoders.pop(listener_id, None)
 
     def _mix_loop(self):
         frame_period = 0.020
@@ -147,15 +159,7 @@ class RoomMixer:
                 source_items = self._collect_frames_locked()
 
             if source_items:
-                active_sender_ids = [sender_id for sender_id, _pcm in source_items]
-                frames = [pcm for _sender_id, pcm in source_items]
-                mixed_pcm = self._mix_pcm_frames(frames)
-                try:
-                    opus = self.encoder.encode(mixed_pcm)
-                except Exception:
-                    opus = b""
-                if opus:
-                    self._enqueue_packet(opus, active_sender_ids)
+                self._enqueue_mix_frame(source_items)
 
             elapsed = time.perf_counter() - start
             time.sleep(max(0.0, frame_period - elapsed))
@@ -399,6 +403,7 @@ class VoiceServer:
         await writer.wait_closed()
 
     def join_room(self, client_id, room_id):
+        old_mixer = None
         with self.state_lock:
             client = self.clients.get(client_id)
             if client is None:
@@ -409,6 +414,7 @@ class VoiceServer:
                 self.get_or_create_mixer(room_id)
                 return
             if old_room and old_room != room_id:
+                old_mixer = self.room_mixers.get(old_room)
                 self.rooms[old_room].discard(client_id)
                 if not self.rooms[old_room]:
                     self.rooms.pop(old_room, None)
@@ -421,6 +427,8 @@ class VoiceServer:
             client.last_heartbeat = time.time()
             self.rooms[room_id].add(client_id)
 
+        if old_mixer is not None:
+            old_mixer.remove_listener(client_id)
         if stale_mixer is not None:
             stale_mixer.stop()
         self.get_or_create_mixer(room_id)
@@ -442,6 +450,7 @@ class VoiceServer:
                 mixer = self.room_mixers.get(room_id)
                 if mixer is not None:
                     mixer.remove_source(client_id)
+                    mixer.remove_listener(client_id)
 
         if mixer_to_stop is not None:
             mixer_to_stop.stop()
@@ -571,31 +580,48 @@ class VoiceServer:
                     for client_id in self.rooms.get(room_id, set()):
                         client = self.clients.get(client_id)
                         if client is not None:
-                            listeners.append((client_id, client.addr))
+                            hear_targets = None
+                            if client.hear_targets is not None:
+                                hear_targets = set(client.hear_targets)
+                            listeners.append((client_id, client.addr, hear_targets))
                     room_entries.append((mixer, listeners))
 
             for mixer, listeners in room_entries:
                 if not listeners:
                     continue
-                packets = mixer.drain_packets(limit=64)
-                if not packets:
+                mix_frames = mixer.drain_packets(limit=64)
+                if not mix_frames:
                     continue
-                for packet, active_sender_ids in packets:
-                    skip_self_id = active_sender_ids[0] if len(active_sender_ids) == 1 else None
-                    for listener_id, listener_addr in listeners:
-                        if skip_self_id is not None and listener_id == skip_self_id:
+                for seq, source_items in mix_frames:
+                    active_sender_ids = tuple(sender_id for sender_id, _pcm in source_items)
+                    for listener_id, listener_addr, hear_targets in listeners:
+                        active_others = [sid for sid in active_sender_ids if sid != listener_id]
+                        if not active_others:
                             continue
-
-                        with self.state_lock:
-                            listener = self.clients.get(listener_id)
-                            hear_targets = None if listener is None else listener.hear_targets
 
                         # If listener configured explicit hear targets, suppress packets that
                         # include any speaker outside that allow-list.
-                        if hear_targets is not None:
-                            active_others = [sid for sid in active_sender_ids if sid != listener_id]
-                            if any(sid not in hear_targets for sid in active_others):
-                                continue
+                        if hear_targets is not None and any(sid not in hear_targets for sid in active_others):
+                            continue
+
+                        frames = [
+                            pcm
+                            for sender_id, pcm in source_items
+                            if sender_id != listener_id
+                        ]
+                        if not frames:
+                            continue
+
+                        mixed_pcm = mixer._mix_pcm_frames(frames)
+                        try:
+                            encoder = mixer.get_or_create_listener_encoder(listener_id)
+                            opus = encoder.encode(mixed_pcm)
+                        except Exception as err:
+                            logging.debug("Mix encode error for %s: %s", listener_id, err)
+                            continue
+                        if not opus:
+                            continue
+                        packet = f"MIXED|{seq}|".encode("ascii") + opus
 
                         try:
                             await self.loop.sock_sendto(self.udp_sock, packet, listener_addr)
