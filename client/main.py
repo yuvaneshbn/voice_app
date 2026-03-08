@@ -130,6 +130,43 @@ def join_room(server_ip, client_id, room_id=DEFAULT_ROOM):
     return True, multicast_addr, join_response
 
 
+
+
+def parse_route_response(response):
+    if not response.startswith("OK:"):
+        return None
+    payload = response[3:]
+    fields = {}
+    for token in payload.split(";"):
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        fields[key.strip().upper()] = value.strip()
+
+    role = fields.get("ROLE", "leaf").lower()
+    up_raw = fields.get("UP", "-")
+    down_raw = fields.get("DOWN", "")
+
+    uplink = None
+    if up_raw and up_raw != "-" and ":" in up_raw:
+        host, port_raw = up_raw.rsplit(":", 1)
+        try:
+            uplink = (host, int(port_raw))
+        except ValueError:
+            uplink = None
+
+    downlinks = {}
+    for entry in down_raw.split(","):
+        if not entry or "@" not in entry or ":" not in entry:
+            continue
+        cid, target = entry.split("@", 1)
+        host, port_raw = target.rsplit(":", 1)
+        try:
+            downlinks[cid] = (host, int(port_raw))
+        except ValueError:
+            continue
+
+    return role, uplink, downlinks
 class VolumeControlPanel:
     def __init__(self, audio, parent=None):
         self.audio = audio
@@ -388,6 +425,7 @@ class MainWindow(QMainWindow):
         self._hb_stop = threading.Event()
         self._unregistered = False
         self._cleaned_up = False
+        self._last_route_refresh = 0.0
 
         root = load_ui_widget(MAIN_WINDOW_UI, self)
         self.root = root
@@ -474,6 +512,7 @@ class MainWindow(QMainWindow):
         self._set_connected_state(True)
 
         self.refresh_participants()
+        self.refresh_distributed_route(silent=True)
         threading.Thread(target=self.heartbeat_loop, daemon=True, name="heartbeat").start()
 
     def _set_connected_state(self, connected, detail=""):
@@ -684,7 +723,38 @@ class MainWindow(QMainWindow):
 
         self._set_connected_state(True, "Reconnected to server")
         self.refresh_participants()
+        self.refresh_distributed_route(silent=True)
         return True, "Re-registered and joined room main."
+
+
+    def refresh_distributed_route(self, silent=True):
+        cpu_score = 50.0
+        if self.audio.capture_level > 0:
+            cpu_score = max(10.0, 100.0 - (self.audio.capture_level * 0.7))
+        latency_ms = 12.0 if self.connected else 120.0
+        send_control_command(self.server_ip, f"METRICS:{self.my_id}:{cpu_score:.1f}:{latency_ms:.1f}")
+
+        ok, route_response = send_control_command(self.server_ip, f"ROUTE:{self.my_id}")
+        if not ok:
+            if not silent:
+                self._set_connected_state(False, f"Route refresh failed: {route_response}")
+            return
+
+        parsed = parse_route_response(route_response)
+        if parsed is None:
+            if not silent:
+                self._set_connected_state(False, f"Invalid route response: {route_response}")
+            return
+
+        role, uplink, downlinks = parsed
+        self.audio.update_route(role, uplink, downlinks)
+
+    def _periodic_route_refresh(self):
+        now = time.time()
+        if (now - self._last_route_refresh) < 4.0:
+            return
+        self._last_route_refresh = now
+        self.refresh_distributed_route(silent=True)
 
     def heartbeat_loop(self):
         while not self._hb_stop.is_set():
@@ -707,6 +777,7 @@ class MainWindow(QMainWindow):
                 self._set_connected_state(False, "Disconnected from server")
 
     def update_live_ui(self):
+        self._periodic_route_refresh()
         mic_level = self.audio.capture_level
         self.system_level_bar.setValue(mic_level)
         self.volume_controls.set_mic_level(mic_level)

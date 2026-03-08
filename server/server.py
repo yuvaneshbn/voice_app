@@ -43,6 +43,9 @@ class Client:
         self.targets = set()
         self.hear_targets = None  # None means allow all speakers in room.
         self.last_heartbeat = time.time()
+        self.cpu_score = 0.0
+        self.latency_ms = 9999.0
+        self.is_router = False
 
 
 class RoomMixer:
@@ -197,6 +200,80 @@ class VoiceServer:
         self._shutdown_done = False
 
         self.state_lock = threading.RLock()
+
+    @staticmethod
+    def _router_count_for_room(member_count):
+        if member_count <= 0:
+            return 0
+        if member_count <= 50:
+            return 1
+        if member_count <= 120:
+            return 2
+        return 3
+
+    def _recompute_room_topology_locked(self, room_id):
+        members = [self.clients[cid] for cid in self.rooms.get(room_id, set()) if cid in self.clients]
+        for client in members:
+            client.is_router = False
+
+        if not members:
+            return
+
+        router_count = min(len(members), self._router_count_for_room(len(members)))
+        ranked = sorted(
+            members,
+            key=lambda c: (-float(c.cpu_score), float(c.latency_ms), c.client_id),
+        )
+        for router in ranked[:router_count]:
+            router.is_router = True
+
+    def _route_snapshot_for_client_locked(self, client_id):
+        client = self.clients.get(client_id)
+        if client is None or not client.room:
+            return {"role": "leaf", "up": None, "down": []}
+
+        room_members = [self.clients[cid] for cid in self.rooms.get(client.room, set()) if cid in self.clients]
+        routers = [member for member in room_members if member.is_router]
+        routers.sort(key=lambda c: c.client_id)
+        root_router = routers[0] if routers else None
+
+        up = None
+        down = []
+
+        if client.is_router:
+            role = "router"
+            if root_router is not None and root_router.client_id != client.client_id:
+                up = root_router.addr
+
+            if root_router is not None and root_router.client_id == client.client_id:
+                for router in routers[1:]:
+                    down.append((router.client_id, router.addr))
+                leaves = [m for m in room_members if not m.is_router]
+                child_slots = [root_router] + routers[1:]
+                for idx, leaf in enumerate(sorted(leaves, key=lambda c: c.client_id)):
+                    assigned_router = child_slots[idx % len(child_slots)]
+                    if assigned_router.client_id == client.client_id:
+                        down.append((leaf.client_id, leaf.addr))
+            else:
+                for member in room_members:
+                    if member.is_router or member.client_id == client.client_id:
+                        continue
+                    down.append((member.client_id, member.addr))
+        else:
+            role = "leaf"
+            if root_router is not None:
+                if len(routers) == 1:
+                    assigned_router = root_router
+                else:
+                    leaves = sorted([m for m in room_members if not m.is_router], key=lambda c: c.client_id)
+                    routers_cycle = [root_router] + routers[1:]
+                    assignment = {}
+                    for idx, leaf in enumerate(leaves):
+                        assignment[leaf.client_id] = routers_cycle[idx % len(routers_cycle)]
+                    assigned_router = assignment.get(client.client_id, root_router)
+                up = assigned_router.addr
+
+        return {"role": role, "up": up, "down": down}
 
     @staticmethod
     def get_multicast_addr(room_id):
@@ -366,6 +443,34 @@ class VoiceServer:
                     m_addr = self.get_multicast_addr(room_id)
                     response = f"OK:{m_addr}\n".encode()
 
+            elif cmd == "METRICS" and len(parts) >= 4:
+                with self.state_lock:
+                    client = self.clients.get(client_id)
+                    if client is not None:
+                        try:
+                            client.cpu_score = max(0.0, min(100.0, float(parts[2])))
+                        except ValueError:
+                            client.cpu_score = 0.0
+                        try:
+                            client.latency_ms = max(1.0, min(9999.0, float(parts[3])))
+                        except ValueError:
+                            client.latency_ms = 9999.0
+                        self._touch_client_locked(client_id)
+                        if client.room:
+                            self._recompute_room_topology_locked(client.room)
+                        response = b"OK\n"
+
+            elif cmd == "ROUTE":
+                with self.state_lock:
+                    client = self.clients.get(client_id)
+                    if client is not None and client.room:
+                        self._recompute_room_topology_locked(client.room)
+                        route = self._route_snapshot_for_client_locked(client_id)
+                        up = route["up"]
+                        up_s = f"{up[0]}:{up[1]}" if up else "-"
+                        down_s = ",".join(f"{cid}@{addr[0]}:{addr[1]}" for cid, addr in route["down"])
+                        response = f"OK:ROLE={route['role']};UP={up_s};DOWN={down_s}\n".encode()
+
             elif cmd in ("TARGETS", "TALK"):
                 with self.state_lock:
                     client = self.clients.get(client_id)
@@ -412,6 +517,7 @@ class VoiceServer:
             if old_room == room_id and client_id in self.rooms.get(room_id, set()):
                 client.last_heartbeat = time.time()
                 self.get_or_create_mixer(room_id)
+                self._recompute_room_topology_locked(room_id)
                 return
             if old_room and old_room != room_id:
                 old_mixer = self.room_mixers.get(old_room)
@@ -421,11 +527,13 @@ class VoiceServer:
                     stale_mixer = self.room_mixers.pop(old_room, None)
                 else:
                     stale_mixer = None
+                    self._recompute_room_topology_locked(old_room)
             else:
                 stale_mixer = None
             client.room = room_id
             client.last_heartbeat = time.time()
             self.rooms[room_id].add(client_id)
+            self._recompute_room_topology_locked(room_id)
 
         if old_mixer is not None:
             old_mixer.remove_listener(client_id)
@@ -447,6 +555,8 @@ class VoiceServer:
                     if not room_members:
                         self.rooms.pop(room_id, None)
                         mixer_to_stop = self.room_mixers.pop(room_id, None)
+                    else:
+                        self._recompute_room_topology_locked(room_id)
                 mixer = self.room_mixers.get(room_id)
                 if mixer is not None:
                     mixer.remove_source(client_id)

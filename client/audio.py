@@ -4,6 +4,8 @@ import threading
 import time
 from collections import deque
 
+from typing import Optional
+
 import pyaudio
 
 from echo_cancel import EchoCanceller, echo_cancel_available
@@ -67,6 +69,12 @@ class AudioEngine:
         self.send_thread = None
         self.listen_thread = None
         self.server_ip = None
+        self.route_role = "leaf"
+        self.route_uplink: Optional[tuple[str, int]] = None
+        self.route_downlinks = {}
+        self.route_lock = threading.Lock()
+        self.route_ttl = 8
+        self.forward_cache = deque(maxlen=2048)
 
         # Runtime controls
         self.master_volume = 1.0
@@ -327,23 +335,100 @@ class AudioEngine:
                 continue
             self._handle_incoming_packet(data, addr)
 
-    def _handle_incoming_packet(self, data, addr):
-        opus = b""
+    def update_route(self, role, uplink, downlinks):
+        with self.route_lock:
+            self.route_role = role if role in ("router", "leaf") else "leaf"
+            self.route_uplink = uplink
+            self.route_downlinks = dict(downlinks or {})
 
-        if data.startswith(b"MIXED|"):
-            try:
-                _tag, _seq_raw, opus = data.split(b"|", 2)
-            except Exception:
+    def _parse_routed_packet(self, data):
+        if not data.startswith(b"ROUTE|") or b":" not in data:
+            return None
+        header, opus = data.split(b":", 1)
+        parts = header.decode(errors="ignore").split("|")
+        if len(parts) != 5:
+            return None
+        _tag, origin_id, seq_raw, ts_raw, ttl_raw = parts
+        try:
+            seq = int(seq_raw)
+            timestamp = int(ts_raw)
+            ttl = int(ttl_raw)
+        except ValueError:
+            return None
+        return origin_id, seq, timestamp, ttl, opus
+
+    @staticmethod
+    def _build_routed_packet(origin_id, seq, timestamp, ttl, opus):
+        header = f"ROUTE|{origin_id}|{seq}|{timestamp}|{ttl}".encode()
+        return header + b":" + opus
+
+    def _forward_routed_packet(self, packet, source_addr, ttl):
+        if ttl <= 0:
+            return
+        out_sock = self.send_sock or self.recv_sock
+        src = tuple(source_addr) if source_addr else None
+        with self.route_lock:
+            if self.route_role != "router":
                 return
-        elif b":" in data:
-            # Backward compatibility with older unicast format.
-            header, opus = data.split(b":", 1)
-            header_s = header.decode(errors="ignore")
-            sender_id = header_s.split("|", 1)[0].strip()
-            if sender_id and sender_id == self.client_id:
+            uplink = self.route_uplink
+            downlinks = dict(self.route_downlinks)
+
+        targets = []
+        if uplink and src == uplink:
+            targets = [addr for addr in downlinks.values() if addr != src]
+        elif src in downlinks.values():
+            if uplink is not None:
+                targets.append(uplink)
+            targets.extend(addr for addr in downlinks.values() if addr != src)
+        else:
+            if uplink is not None:
+                targets.append(uplink)
+            targets.extend(downlinks.values())
+
+        unique = []
+        seen = set()
+        for target in targets:
+            if target in seen:
+                continue
+            seen.add(target)
+            unique.append(target)
+
+        for target in unique:
+            try:
+                out_sock.sendto(packet, target)
+            except Exception as e:
+                print(f"[AUDIO] Route forward error to {target}: {e}")
+
+    def _handle_incoming_packet(self, data, addr):
+        routed = self._parse_routed_packet(data)
+        if routed is not None:
+            origin_id, seq, timestamp, ttl, opus = routed
+            cache_key = (origin_id, seq)
+            if cache_key in self.forward_cache:
+                return
+            self.forward_cache.append(cache_key)
+
+            if self.route_role == "router" and ttl > 0:
+                fwd_packet = self._build_routed_packet(origin_id, seq, timestamp, ttl - 1, opus)
+                self._forward_routed_packet(fwd_packet, addr, ttl - 1)
+
+            if origin_id == self.client_id:
                 return
         else:
-            opus = data
+            opus = b""
+            if data.startswith(b"MIXED|"):
+                try:
+                    _tag, _seq_raw, opus = data.split(b"|", 2)
+                except Exception:
+                    return
+            elif b":" in data:
+                header, opus = data.split(b":", 1)
+                header_s = header.decode(errors="ignore")
+                sender_id = header_s.split("|", 1)[0].strip()
+                if sender_id and sender_id == self.client_id:
+                    return
+            else:
+                opus = data
 
         if not opus:
             return
@@ -457,11 +542,13 @@ class AudioEngine:
                     if opus:
                         if not self.running or self.send_sock is None:
                             break
-                        header = f"{self.client_id}|{self.seq}|{self.timestamp}".encode()
-                        packet = header + b":" + opus
+                        with self.route_lock:
+                            uplink = self.route_uplink
+                        target = uplink if uplink is not None else (server_ip, AUDIO_PORT)
+                        packet = self._build_routed_packet(self.client_id, self.seq, self.timestamp, self.route_ttl, opus)
                         self.seq = (self.seq + 1) & 0xFFFF
                         self.timestamp += FRAME
-                        self.send_sock.sendto(packet, (server_ip, AUDIO_PORT))
+                        self.send_sock.sendto(packet, target)
                         packet_count += 1
                         if packet_count % 100 == 0:
                             print(f"[AUDIO] Sent {packet_count} packets from {self.client_id}")

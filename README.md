@@ -10,7 +10,8 @@ It uses:
 The repository includes:
 
 - A PySide6 desktop client
-- A Python asyncio server with per-room audio mixing
+- A Python asyncio control-plane server with optional per-room mixer fallback
+- Distributed SFU tree routing where elected client routers forward Opus/RTP-style packets
 - Native audio helper DLL integration (`native_mixer.dll`)
 - Optional Windows QoS policy installer
 
@@ -39,9 +40,11 @@ The repository includes:
 
 This is a room-based voice chat system:
 
-- Clients capture mic PCM, encode with Opus, and send UDP packets to server.
-- Server decodes each sender stream, mixes active speakers per room, re-encodes to Opus, and unicasts mixed audio to listeners in that room.
-- Client UI controls who you talk to (`TARGETS`) and who you hear (`HEAR`).
+- Clients capture mic PCM, encode with Opus, and send UDP packets to an elected router client.
+- Router clients forward packets in a tree (SFU-style, no central media mixing).
+- Each client decodes incoming streams and mixes playback locally.
+- The server coordinates membership, router election, and route topology.
+- Legacy server-side room mixing remains available as a fallback path.
 
 The default room is `main`.
 
@@ -57,6 +60,7 @@ The default room is `main`.
 - Heartbeat (`PING`) and stale-client pruning
 - Room join (`JOIN`) and participant listing (`LIST`)
 - Directed talk targets and listener hear-filters
+- Router-aware telemetry (`METRICS`) and route distribution (`ROUTE`)
 
 ### Audio
 
