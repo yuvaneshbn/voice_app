@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>SettingsDialogForm</class>
+ <widget class="QWidget" name="SettingsDialogForm">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>295</width>
+    <height>313</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Settings - EchoChat</string>
+  </property>
+  <layout class="QVBoxLayout" name="rootLayout">
+   <item>
+    <widget class="QLabel" name="headerLabel">
+     <property name="text">
+      <string>Settings</string>
+     </property>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="audioDevicesGroup">
+     <property name="title">
+      <string>Audio Devices</string>
+     </property>
+     <layout class="QFormLayout" name="audioDevicesLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="inputDeviceLabel">
+        <property name="text">
+         <string>Input Device:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <widget class="QComboBox" name="inputDeviceCombo"/>
+      </item>
+      <item row="1" column="0">
+       <widget class="QLabel" name="outputDeviceLabel">
+        <property name="text">
+         <string>Output Device:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="1" column="1">
+       <widget class="QComboBox" name="outputDeviceCombo"/>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="advancedAudioGroup">
+     <property name="title">
+      <string>Advanced Audio</string>
+     </property>
+     <layout class="QVBoxLayout" name="advancedAudioLayout">
+      <item>
+       <widget class="QLabel" name="volumeControlHint">
+        <property name="text">
+         <string>Embed VolumeControl form here</string>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <widget class="QGroupBox" name="networkGroup">
+     <property name="title">
+      <string>Network</string>
+     </property>
+     <layout class="QFormLayout" name="networkLayout">
+      <item row="0" column="0">
+       <widget class="QLabel" name="serverIpTitle">
+        <property name="text">
+         <string>Server IP:</string>
+        </property>
+       </widget>
+      </item>
+      <item row="0" column="1">
+       <layout class="QHBoxLayout" name="serverRow">
+        <item>
+         <widget class="QLabel" name="serverIpValue">
+          <property name="text">
+           <string>192.168.x.xxx</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="reconnectButton">
+          <property name="text">
+           <string>Reconnect</string>
+          </property>
+         </widget>
+        </item>
+       </layout>
+      </item>
+     </layout>
+    </widget>
+   </item>
+   <item>
+    <layout class="QHBoxLayout" name="footerButtonsLayout">
+     <item>
+      <spacer name="footerSpacer">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QPushButton" name="saveCloseButton">
+       <property name="text">
+        <string>Save and Close</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="cancelButton">
+       <property name="text">
+        <string>Cancel</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>

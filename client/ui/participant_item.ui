@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>ParticipantItemForm</class>
+ <widget class="QWidget" name="ParticipantItemForm">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>266</width>
+    <height>75</height>
+   </rect>
+  </property>
+  <layout class="QVBoxLayout" name="rootLayout">
+   <item>
+    <layout class="QHBoxLayout" name="rowLayout">
+     <item>
+      <widget class="QLabel" name="participantName">
+       <property name="text">
+        <string>Client Name</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QCheckBox" name="talkCheckbox">
+       <property name="text">
+        <string>Talk</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QCheckBox" name="muteCheckbox">
+       <property name="text">
+        <string>Mute</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QLabel" name="micStatusLabel">
+       <property name="text">
+        <string>Mic: Off</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QProgressBar" name="participantVolumeBar">
+     <property name="textVisible">
+      <bool>false</bool>
+     </property>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
