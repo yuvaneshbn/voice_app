@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # OYX
 
 OYX is a Windows LAN voice communication system with:
@@ -39,15 +40,10 @@ The default user flow is:
 |-- third_party/opus/         # Vendored Opus headers + Windows binaries
 |-- build/                    # Local build output (ignored)
 `-- build-mingw/              # Alternate local build output (ignored)
-```
 
 ## Features
 
 - LAN server discovery on UDP port `50000`
-- Client registration and control channel over TCP port `50001`
-- Voice transport and mixed audio return over UDP port `50002`
-- Opus encoding/decoding at `16 kHz`, mono, 20 ms frames
-- Participant targeting: talk only to selected participants
 - Local receive muting per participant
 - Broadcast mode to target everyone in the room
 - Automatic client heartbeat and stale client pruning
@@ -55,10 +51,6 @@ The default user flow is:
 - Input gain, mic sensitivity, output/master volume controls
 - Optional noise gate style suppression
 - Optional automatic gain control
-- Optional native echo cancellation when `native_mixer.dll` is available
-
-## Requirements
-
 ### Software
 
 - Windows 10 or Windows 11
@@ -85,43 +77,21 @@ If those files are missing, CMake will stop with a fatal error.
 
 ### Build Options
 
-Top-level CMake options:
-
-- `VOICE_BUILD_CLIENT=ON` builds the Qt desktop client
-- `VOICE_BUILD_SERVER=ON` builds the voice server
-- `VOICE_BUILD_AUDIO_NATIVE=OFF` builds the optional `native_mixer` DLL
-
-By default:
-
-- client: enabled
-- server: enabled
-- native mixer: disabled
-
-## Build Instructions
 
 ### Visual Studio / MSVC
 
 Configure:
 
-```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-```
 
 Build:
-
-```powershell
 cmake --build build --config Release
 ```
 
 Artifacts are placed under:
 
-- `build/bin/voice_server.exe`
-- `build/bin/voice_client.exe`
 
 The build also copies runtime dependencies such as:
 
-- `opus.dll`
-- `libportaudio.dll`
 - client UI files in `client/ui`
 - `technical-support.ico`
 
@@ -129,15 +99,9 @@ If Qt deployment tooling is found, `windeployqt.exe` is invoked automatically fo
 
 ### Build With Native Echo Cancellation
 
-This is optional and Windows/MSVC-oriented.
-
-```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DVOICE_BUILD_AUDIO_NATIVE=ON
 cmake --build build --config Release
 ```
-
-Notes:
-
 - The repository vendors an AEC3 source tree under `audio_native/third_party/AEC3`
 - If `TWOWAY_AEC3_DIR` is set, CMake will use that path instead
 - MinGW builds automatically disable `VOICE_BUILD_AUDIO_NATIVE`
@@ -157,15 +121,9 @@ You may need to override `Qt6_DIR`, `QT6_ROOT`, and `PORTAUDIO_DLL` for your loc
 
 ## Running
 
-### 1. Start the Server
-
 From the build output directory:
 
 ```powershell
-.\voice_server.exe
-```
-
-On startup the server binds:
 
 - UDP discovery/audio receive: `50000` and `50002`
 - TCP control: `50001`
@@ -180,9 +138,6 @@ Expected console output includes:
 ```powershell
 .\voice_client.exe
 ```
-
-Client startup sequence:
-
 1. Initialize WinSock and PortAudio
 2. Open a local UDP receive socket on an ephemeral port
 3. Discover the server by listening for `VOICE_SERVER` broadcasts on port `50000`
@@ -210,12 +165,8 @@ Main behaviors visible in the code:
 
 ### Registration Secret
 
-Server and client both use the environment variable `VOICE_REGISTER_SECRET`.
-
 If the variable is not set, both sides fall back to:
 
-```text
-mysecret
 ```
 
 Set it before launching the server and clients if you want a non-default shared secret:
@@ -237,12 +188,6 @@ $env:VOICE_REGISTER_SECRET="replace-this"
 The client loads PortAudio dynamically. It searches in this order:
 
 1. `libportaudio.dll` beside the executable
-2. `libportaudio.dll` via normal DLL search
-3. the compiled fallback path from `VOICE_PORTAUDIO_DLL_FALLBACK`
-
-If PortAudio cannot be loaded, the client throws an error during startup.
-
-## Network Protocol Summary
 
 This section documents the protocol implemented in the code today.
 
@@ -290,17 +235,8 @@ Transport: UDP `50002`
 
 Client to server packet format:
 
-```text
-<client_id>|<seq>|<timestamp>:<opus_payload>
-```
 
 Server to client mixed packet format:
-
-```text
-MIXED|<seq>|<opus_payload>
-```
-
-The server:
 
 - decodes incoming Opus frames
 - tracks room membership
@@ -309,22 +245,9 @@ The server:
 - re-encodes the mixed PCM with a listener-specific Opus encoder
 
 ## Architecture Notes
-
-### Server
-
-`voice_server` runs several background threads:
-
-- discovery broadcast loop
-- TCP control accept loop
-- UDP audio receive loop
-- mixed audio send loop
 - stale client prune loop
 
 Each room gets a `RoomMixer` instance that:
-
-- stores the latest PCM frame per active sender
-- drops stale sources quickly
-- queues 20 ms mix frames
 - creates per-listener Opus encoders on demand
 
 ### Client
@@ -344,11 +267,6 @@ The client only starts transmit capture when at least one talk target is selecte
 Current signal path in `AudioEngine`:
 
 1. capture 16-bit mono PCM with PortAudio
-2. calculate input peak / activity
-3. optionally apply native echo cancellation
-4. optionally apply a simple suppression gate
-5. apply manual gain and optional auto gain
-6. encode with Opus
 7. send via UDP to the server
 
 Receive path:
@@ -356,28 +274,14 @@ Receive path:
 1. receive mixed UDP packet
 2. extract Opus payload
 3. decode to PCM
-4. queue for playback
-5. apply output/master volume
-6. optionally feed reverse stream into the echo canceller
-
-## Limitations and Known Constraints
 
 - Windows-first codebase; not portable as-is
 - Room selection is effectively fixed to the default room `main` in the client flow
-- Discovery is LAN-oriented and depends on broadcast/local addressing assumptions
-- There is no persistence, authentication system, or encryption beyond the shared registration secret
-- The secret defaults to `mysecret`, which is not suitable for real deployments
-- The client assumes the required DLLs are present at runtime
 - No automated tests are present in this repository
 - Large vendored native code under `audio_native/third_party/AEC3` makes builds heavier and repo size larger
 
 ## Troubleshooting
 
-### Client cannot find the server
-
-- Make sure `voice_server.exe` is running first
-- Ensure Windows Firewall allows UDP `50000` and `50002`, and TCP `50001`
-- Try manual IP entry when the startup dialog appears
 - Verify client and server are on the same LAN/subnet
 
 ### Registration fails
@@ -415,3 +319,81 @@ This repository includes a top-level [LICENSE](LICENSE) file. Review third-party
 - Opus
 - PortAudio
 - vendored AEC3 / related upstream code
+=======
+[README.md](https://github.com/user-attachments/files/24697304/README.md)
+# Voice App - LAN Intercom System
+
+A UDP-based LAN intercom system that allows multiple PCs on the same network to communicate via voice. Supports private messaging, broadcasting, and selective hearing.
+
+## Features
+
+- **Client Identity**: Select unique IDs (Client 1-4).
+- **Private Talk**: Send voice to specific clients.
+- **Broadcast**: Send voice to all clients.
+- **Selective Hearing**: Control which clients' audio you listen to.
+- **Real-time Audio**: Low-latency voice communication over LAN.
+
+## Requirements
+
+- Python 3.7+
+- Windows/Linux/Mac (with audio devices)
+- All PCs on the same local network (same subnet)
+
+## Installation
+
+1. Clone or download the project.
+2. Install dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
+3. (Optional) Build executables with PyInstaller:
+   - For client: `cd client && pyinstaller main.spec`
+   - For server: `cd server && pyinstaller server.spec`
+   - Run the EXEs from `dist/` folders.
+
+## Usage
+
+### Running the Server
+On one PC:
+```
+cd server
+python server.py
+```
+The server broadcasts its presence and handles audio routing.
+
+### Running Clients
+On each client PC:
+```
+cd client
+python main.py
+```
+- Auto-discovers server; if not found, enter IP manually.
+- Select a unique Client ID (1-4).
+- Use TALK buttons (bottom row) to select recipients.
+- Use HEAR buttons (upper row) to select who to listen to.
+- Click TALK (center) for broadcast.
+
+## Network Setup
+
+- Ensure firewalls allow UDP on ports 50000-50002.
+- Test with `ping` between PCs.
+- For LAN, use same Wi-Fi or Ethernet.
+
+## Troubleshooting
+
+- **No Audio**: Check microphone/speaker settings.
+- **Discovery Fails**: Enter server IP manually.
+- **Port Issues**: Ensure ports are open.
+- **Dependencies**: Run `pip install -r requirements.txt`.
+
+## Project Structure
+
+- `client/`: Client application files.
+- `server/`: Server application files.
+- `requirements.txt`: Python dependencies.
+- `README.md`: This file.
+
+## License
+
+None specified.
+>>>>>>> bb2adb6ec9f871df336e34894c2292358fbf2e4b
